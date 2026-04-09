@@ -8,6 +8,7 @@ import (
 	"io"
 	"iter"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -74,6 +75,10 @@ func (m *Model) generate(ctx context.Context, req *adkmodel.LLMRequest) (*adkmod
 		Model:       m.resolveModel(req),
 		Messages:    buildMessages(req),
 		Temperature: extractTemperature(req),
+		Tools:       buildTools(req),
+	}
+	if len(chatReq.Tools) > 0 {
+		chatReq.ToolChoice = "auto"
 	}
 
 	body, err := json.Marshal(chatReq)
@@ -112,15 +117,15 @@ func (m *Model) generate(ctx context.Context, req *adkmodel.LLMRequest) (*adkmod
 		return nil, fmt.Errorf("openai response contained no choices")
 	}
 
-	text := strings.TrimSpace(chatResp.Choices[0].Message.Content)
+	content, finishReason, err := buildResponseContent(chatResp.Choices[0].Message, chatResp.Choices[0].FinishReason)
+	if err != nil {
+		return nil, err
+	}
+
 	return &adkmodel.LLMResponse{
-		Content: &genai.Content{
-			Role: "model",
-			Parts: []*genai.Part{
-				{Text: text},
-			},
-		},
+		Content:      content,
 		ModelVersion: chatResp.Model,
+		FinishReason: genai.FinishReason(finishReason),
 	}, nil
 }
 
@@ -141,40 +146,91 @@ func buildMessages(req *adkmodel.LLMRequest) []openAIMessage {
 		if content == nil {
 			continue
 		}
-
-		role := strings.TrimSpace(content.Role)
-		if role == "" {
-			role = "user"
-		}
-
-		text := contentText(content)
-		if strings.TrimSpace(text) == "" {
-			continue
-		}
-
-		messages = append(messages, openAIMessage{
-			Role:    normalizeRole(role),
-			Content: text,
-		})
+		messages = append(messages, contentToMessages(content)...)
 	}
 	return messages
 }
 
-func contentText(content *genai.Content) string {
-	if content == nil {
-		return ""
+func buildTools(req *adkmodel.LLMRequest) []openAITool {
+	if req == nil || req.Config == nil {
+		return nil
 	}
 
-	parts := make([]string, 0, len(content.Parts))
+	var tools []openAITool
+	for _, candidate := range req.Config.Tools {
+		if candidate == nil {
+			continue
+		}
+		for _, decl := range candidate.FunctionDeclarations {
+			if decl == nil || strings.TrimSpace(decl.Name) == "" {
+				continue
+			}
+			tools = append(tools, openAITool{
+				Type: "function",
+				Function: openAIToolFunction{
+					Name:        decl.Name,
+					Description: decl.Description,
+					Parameters:  decl.ParametersJsonSchema,
+				},
+			})
+		}
+	}
+	return tools
+}
+
+func contentToMessages(content *genai.Content) []openAIMessage {
+	role := normalizeRole(strings.TrimSpace(content.Role))
+	if role == "" {
+		role = "user"
+	}
+
+	textParts := make([]string, 0, len(content.Parts))
+	toolCalls := make([]openAIToolCall, 0)
+	toolResponses := make([]openAIMessage, 0)
+
 	for _, part := range content.Parts {
 		if part == nil {
 			continue
 		}
 		if strings.TrimSpace(part.Text) != "" {
-			parts = append(parts, part.Text)
+			textParts = append(textParts, part.Text)
+		}
+		if part.FunctionCall != nil {
+			toolCalls = append(toolCalls, openAIToolCall{
+				ID:   normalizeCallID(part.FunctionCall.ID, part.FunctionCall.Name),
+				Type: "function",
+				Function: openAIToolCallFunction{
+					Name:      part.FunctionCall.Name,
+					Arguments: mustJSON(part.FunctionCall.Args),
+				},
+			})
+		}
+		if part.FunctionResponse != nil {
+			msg := openAIMessage{
+				Role:       "tool",
+				Name:       part.FunctionResponse.Name,
+				ToolCallID: part.FunctionResponse.ID,
+			}
+			content := mustJSON(part.FunctionResponse.Response)
+			msg.Content = &content
+			toolResponses = append(toolResponses, msg)
 		}
 	}
-	return strings.Join(parts, "\n")
+
+	messages := make([]openAIMessage, 0, 1+len(toolResponses))
+	if len(textParts) > 0 || len(toolCalls) > 0 {
+		msg := openAIMessage{
+			Role:      role,
+			ToolCalls: toolCalls,
+		}
+		if len(textParts) > 0 {
+			text := strings.Join(textParts, "\n")
+			msg.Content = &text
+		}
+		messages = append(messages, msg)
+	}
+	messages = append(messages, toolResponses...)
+	return messages
 }
 
 func normalizeRole(role string) string {
@@ -188,6 +244,70 @@ func normalizeRole(role string) string {
 	}
 }
 
+func buildResponseContent(message openAIMessage, finishReason string) (*genai.Content, string, error) {
+	parts := make([]*genai.Part, 0, len(message.ToolCalls)+1)
+	if message.Content != nil && strings.TrimSpace(*message.Content) != "" {
+		parts = append(parts, &genai.Part{Text: strings.TrimSpace(*message.Content)})
+	}
+
+	for _, call := range message.ToolCalls {
+		args, err := parseArguments(call.Function.Arguments)
+		if err != nil {
+			return nil, finishReason, fmt.Errorf("decode tool call args for %s: %w", call.Function.Name, err)
+		}
+		parts = append(parts, &genai.Part{
+			FunctionCall: &genai.FunctionCall{
+				ID:   call.ID,
+				Name: call.Function.Name,
+				Args: args,
+			},
+		})
+	}
+
+	if len(parts) == 0 {
+		parts = append(parts, &genai.Part{Text: ""})
+	}
+
+	return &genai.Content{
+		Role:  "model",
+		Parts: parts,
+	}, finishReason, nil
+}
+
+func parseArguments(raw string) (map[string]any, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return map[string]any{}, nil
+	}
+
+	var args map[string]any
+	if err := json.Unmarshal([]byte(raw), &args); err != nil {
+		return nil, err
+	}
+	if args == nil {
+		args = map[string]any{}
+	}
+	return args, nil
+}
+
+func mustJSON(value any) string {
+	if value == nil {
+		return "{}"
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
+func normalizeCallID(id, name string) string {
+	if strings.TrimSpace(id) != "" {
+		return id
+	}
+	return "call_" + name + "_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+}
+
 func extractTemperature(req *adkmodel.LLMRequest) *float64 {
 	if req == nil || req.Config == nil || req.Config.Temperature == nil {
 		return nil
@@ -198,19 +318,47 @@ func extractTemperature(req *adkmodel.LLMRequest) *float64 {
 }
 
 type openAIChatRequest struct {
-	Model       string           `json:"model"`
-	Messages    []openAIMessage  `json:"messages"`
-	Temperature *float64         `json:"temperature,omitempty"`
+	Model       string          `json:"model"`
+	Messages    []openAIMessage `json:"messages"`
+	Temperature *float64        `json:"temperature,omitempty"`
+	Tools       []openAITool    `json:"tools,omitempty"`
+	ToolChoice  string          `json:"tool_choice,omitempty"`
 }
 
 type openAIMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string           `json:"role"`
+	Content    *string          `json:"content,omitempty"`
+	Name       string           `json:"name,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
+	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
+}
+
+type openAITool struct {
+	Type     string             `json:"type"`
+	Function openAIToolFunction `json:"function"`
+}
+
+type openAIToolFunction struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Parameters  any    `json:"parameters,omitempty"`
+}
+
+type openAIToolCall struct {
+	ID       string                 `json:"id,omitempty"`
+	Type     string                 `json:"type"`
+	Function openAIToolCallFunction `json:"function"`
+}
+
+type openAIToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 type openAIChatResponse struct {
 	Model   string `json:"model"`
 	Choices []struct {
-		Message openAIMessage `json:"message"`
+		Message      openAIMessage `json:"message"`
+		FinishReason string        `json:"finish_reason"`
 	} `json:"choices"`
 }

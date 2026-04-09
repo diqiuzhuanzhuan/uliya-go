@@ -10,35 +10,45 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"google.golang.org/adk/session/database"
-	"google.golang.org/adk/session"
 	"google.golang.org/adk/agent"
-	"google.golang.org/adk/agent/llmagent"
 	"google.golang.org/adk/cmd/launcher"
 	"google.golang.org/adk/cmd/launcher/full"
+	"google.golang.org/adk/model"
 	"google.golang.org/adk/runner"
+	"google.golang.org/adk/session"
+	"google.golang.org/adk/session/database"
+	"google.golang.org/adk/tool"
+	"google.golang.org/genai"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
-	"google.golang.org/genai"
 
+	"github.com/loong/uliya-go/tools/bashtool"
+	"github.com/loong/uliya-go/tools/filetools"
+	"github.com/loong/uliya-go/tools/movetool"
 	"github.com/loong/uliya-go/openaimodel"
+	"github.com/loong/uliya-go/tools/todotool"
 )
 
 const (
-	consoleUserID = "console_user"
+	consoleUserID  = "console_user"
 	consoleAppName = "uliya_go"
 )
 
 func main() {
 	ctx := context.Background()
 
+	if err := loadDotEnv(".env"); err != nil {
+		log.Fatalf("failed to load .env: %v", err)
+	}
+
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
-		log.Fatal("missing OPENAI_API_KEY, please export it before running")
+		log.Fatal("missing OPENAI_API_KEY; set it in your environment or .env before running")
 	}
 
 	modelName := os.Getenv("OPENAI_MODEL")
@@ -59,16 +69,25 @@ func main() {
 		log.Fatalf("failed to create model: %v", err)
 	}
 
-	chatAgent, err := llmagent.New(llmagent.Config{
-		Name:        "uliya_chat_agent",
-		Model:       model,
-		Description: "A simple chat agent built with adk-go and an OpenAI model.",
-		Instruction: `你是 Uliya，一个友好、简洁、靠谱的 AI 助手。
-你主要职责是和用户自然聊天、回答问题、解释概念，并在信息不足时先说明假设。
-默认使用中文回答；如果用户改用英文，你也可以切换到英文。`,
-	})
+	repoRoot, err := os.Getwd()
 	if err != nil {
-		log.Fatalf("failed to create agent: %v", err)
+		log.Fatalf("failed to get working directory: %v", err)
+	}
+
+	bashTool, err := bashtool.New(repoRoot)
+	if err != nil {
+		log.Fatalf("failed to create bash tool: %v", err)
+	}
+	fileTools, err := filetools.New(repoRoot)
+	if err != nil {
+		log.Fatalf("failed to create file tools: %v", err)
+	}
+	todoTools := todotool.New()
+	moveTools := movetool.New()
+
+	rootAgent, err := newRootAgent(model, repoRoot, fileTools, bashTool, todoTools, moveTools)
+	if err != nil {
+		log.Fatalf("failed to create root workflow agent: %v", err)
 	}
 
 	sessionDBPath := os.Getenv("SESSION_DB_PATH")
@@ -92,7 +111,7 @@ func main() {
 	}
 
 	config := &launcher.Config{
-		AgentLoader:    agent.NewSingleLoader(chatAgent),
+		AgentLoader:    agent.NewSingleLoader(rootAgent),
 		SessionService: sessionService,
 	}
 
@@ -117,6 +136,88 @@ func shouldRunConsole(args []string) bool {
 		return true
 	}
 	return strings.HasPrefix(args[0], "-")
+}
+
+func loadDotEnv(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		if strings.HasPrefix(line, "export ") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		}
+
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+
+		key = strings.TrimSpace(key)
+		if key == "" || os.Getenv(key) != "" {
+			continue
+		}
+
+		value = strings.TrimSpace(value)
+		value = strings.Trim(value, `"'`)
+		if err := os.Setenv(key, expandEnvValue(value)); err != nil {
+			return fmt.Errorf("set %s from %s: %w", key, filepath.Base(path), err)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func expandEnvValue(value string) string {
+	return os.Expand(value, func(name string) string {
+		return os.Getenv(name)
+	})
+}
+
+func syncTodoAfterTool(ctx tool.Context, calledTool tool.Tool, args, result map[string]any, runErr error) (map[string]any, error) {
+	if ctx == nil || calledTool == nil {
+		return nil, nil
+	}
+	if calledTool.Name() == "write_todo" {
+		return nil, nil
+	}
+	if runErr != nil {
+		return nil, nil
+	}
+	if err := todotool.MarkRefreshNeeded(ctx.State(), calledTool.Name()); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func todoReminderBeforeModel(ctx agent.CallbackContext, req *model.LLMRequest) (*model.LLMResponse, error) {
+	if ctx == nil {
+		return nil, nil
+	}
+	active, err := todotool.ActiveTodo(ctx.State())
+	if err != nil {
+		return nil, err
+	}
+	if active == nil {
+		if err := ctx.State().Set("temp:todo_refresh_reminder", ""); err != nil {
+			return nil, err
+		}
+	}
+	return nil, nil
 }
 
 func runConsole(ctx context.Context, config *launcher.Config, args []string) error {
@@ -171,7 +272,7 @@ func runConsole(ctx context.Context, config *launcher.Config, args []string) err
 	}
 
 	fmt.Printf("Current session: %s\n", currentSession.ID())
-	fmt.Println("Commands: /new creates a new chat, /reset clears the current chat, /exit quits.")
+	fmt.Println("Commands: /new creates a new chat, /reset clears the current chat, /undo reverses the last execution, /exit quits.")
 	fmt.Print("\nUser -> ")
 
 	reader := bufio.NewReader(os.Stdin)
@@ -201,6 +302,12 @@ func runConsole(ctx context.Context, config *launcher.Config, args []string) err
 		}
 
 		switch userInput {
+		case "/undo":
+			if err := runUndo(); err != nil {
+				fmt.Printf("Undo failed: %v\n", err)
+			}
+			fmt.Print("User -> ")
+			continue
 		case "/exit", "/quit":
 			return nil
 		case "/new":
@@ -248,7 +355,7 @@ func runConsole(ctx context.Context, config *launcher.Config, args []string) err
 				continue
 			}
 
-			text := contentText(event.LLMResponse.Content)
+			text := contentConsoleOutput(event.LLMResponse.Content)
 			if mode != agent.StreamingModeSSE {
 				fmt.Print(text)
 				continue
@@ -269,10 +376,52 @@ func runConsole(ctx context.Context, config *launcher.Config, args []string) err
 	}
 }
 
+func runUndo() error {
+	ops, err := movetool.LoadOperations()
+	if err != nil {
+		return fmt.Errorf("load operations: %w", err)
+	}
+	if len(ops) == 0 {
+		fmt.Println("Nothing to undo.")
+		return nil
+	}
+
+	fmt.Printf("Undoing %d operation(s)...\n", len(ops))
+	var warnings []string
+	for i := len(ops) - 1; i >= 0; i-- {
+		op := ops[i]
+		switch op.Op {
+		case "move":
+			if err := os.MkdirAll(filepath.Dir(op.Src), 0o755); err != nil {
+				warnings = append(warnings, fmt.Sprintf("mkdir %s: %v", filepath.Dir(op.Src), err))
+				continue
+			}
+			if err := os.Rename(op.Dst, op.Src); err != nil {
+				warnings = append(warnings, fmt.Sprintf("move %s → %s: %v", op.Dst, op.Src, err))
+			}
+		case "create_dir":
+			if err := os.Remove(op.Path); err != nil && !os.IsNotExist(err) {
+				warnings = append(warnings, fmt.Sprintf("rmdir %s: %v (directory may not be empty)", op.Path, err))
+			}
+		}
+	}
+
+	if err := movetool.ClearLog(); err != nil {
+		warnings = append(warnings, fmt.Sprintf("clear log: %v", err))
+	}
+
+	for _, w := range warnings {
+		fmt.Printf("  warning: %s\n", w)
+	}
+	fmt.Printf("Undo complete (%d operations reversed).\n", len(ops))
+	return nil
+}
+
 func printConsoleHelp() {
 	fmt.Println("Usage: go run . [console] [-streaming_mode none|sse] [-shutdown-timeout 2s]")
 	fmt.Println()
 	fmt.Println("Console commands:")
+	fmt.Println("  /undo   reverse the last file-organization execution")
 	fmt.Println("  /new    create a new chat session and keep previous sessions in the database")
 	fmt.Println("  /reset  delete the current chat session and start a fresh one")
 	fmt.Println("  /exit   quit the console")
@@ -305,7 +454,7 @@ func resetSession(ctx context.Context, sessionService interface {
 	return nil
 }
 
-func contentText(content *genai.Content) string {
+func contentConsoleOutput(content *genai.Content) string {
 	if content == nil {
 		return ""
 	}
@@ -315,7 +464,55 @@ func contentText(content *genai.Content) string {
 		if part == nil {
 			continue
 		}
-		builder.WriteString(part.Text)
+		if part.Text != "" {
+			builder.WriteString(part.Text)
+		}
+		if part.FunctionResponse != nil {
+			builder.WriteString(formatFunctionResponseForConsole(part.FunctionResponse))
+		}
 	}
+	return builder.String()
+}
+
+func contentPlainText(content *genai.Content) string {
+	if content == nil {
+		return ""
+	}
+
+	var builder strings.Builder
+	for _, part := range content.Parts {
+		if part == nil {
+			continue
+		}
+		if part.Text != "" {
+			builder.WriteString(part.Text)
+		}
+	}
+	return builder.String()
+}
+
+func formatFunctionResponseForConsole(resp *genai.FunctionResponse) string {
+	if resp == nil {
+		return ""
+	}
+	if resp.Name != "write_todo" {
+		return ""
+	}
+
+	var builder strings.Builder
+	builder.WriteString("\n\n[Todo List Updated]\n")
+
+	if todoList, ok := resp.Response["todo_list"].(string); ok && strings.TrimSpace(todoList) != "" {
+		builder.WriteString(todoList)
+		builder.WriteString("\n")
+		return builder.String()
+	}
+
+	if total, ok := resp.Response["total_items"]; ok {
+		builder.WriteString(fmt.Sprintf("Total items: %v\n", total))
+		return builder.String()
+	}
+
+	builder.WriteString("(todo list updated)\n")
 	return builder.String()
 }
