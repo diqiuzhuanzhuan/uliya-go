@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,10 +28,10 @@ import (
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 
+	"github.com/loong/uliya-go/openaimodel"
 	"github.com/loong/uliya-go/tools/bashtool"
 	"github.com/loong/uliya-go/tools/filetools"
 	"github.com/loong/uliya-go/tools/movetool"
-	"github.com/loong/uliya-go/openaimodel"
 	"github.com/loong/uliya-go/tools/todotool"
 )
 
@@ -217,6 +218,13 @@ func todoReminderBeforeModel(ctx agent.CallbackContext, req *model.LLMRequest) (
 			return nil, err
 		}
 	}
+	reminder, err := todotool.RefreshReminder(ctx.State())
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(reminder) != "" && req != nil {
+		req.Contents = append(req.Contents, genai.NewContentFromText(reminder, genai.RoleUser))
+	}
 	return nil, nil
 }
 
@@ -286,8 +294,12 @@ func runConsole(ctx context.Context, config *launcher.Config, args []string) err
 		default:
 		}
 
-		line, err := reader.ReadString('\n')
+		line, err := readConsoleInputLine(reader, os.Stdin, os.Stdout)
 		if err != nil {
+			if errors.Is(err, errConsoleInterrupted) {
+				fmt.Println()
+				return nil
+			}
 			if errors.Is(err, io.EOF) {
 				fmt.Println("\nEOF detected, exiting...")
 				return nil
@@ -355,7 +367,7 @@ func runConsole(ctx context.Context, config *launcher.Config, args []string) err
 				continue
 			}
 
-			text := contentConsoleOutput(event.LLMResponse.Content)
+			text := contentConsoleOutput(event)
 			if mode != agent.StreamingModeSSE {
 				fmt.Print(text)
 				continue
@@ -454,11 +466,13 @@ func resetSession(ctx context.Context, sessionService interface {
 	return nil
 }
 
-func contentConsoleOutput(content *genai.Content) string {
-	if content == nil {
+func contentConsoleOutput(event *session.Event) string {
+	if event == nil || event.LLMResponse.Content == nil {
 		return ""
 	}
 
+	content := event.LLMResponse.Content
+	agentName := strings.TrimSpace(event.Author)
 	var builder strings.Builder
 	for _, part := range content.Parts {
 		if part == nil {
@@ -467,8 +481,11 @@ func contentConsoleOutput(content *genai.Content) string {
 		if part.Text != "" {
 			builder.WriteString(part.Text)
 		}
+		if part.FunctionCall != nil {
+			builder.WriteString(formatFunctionCallForConsole(agentName, part.FunctionCall))
+		}
 		if part.FunctionResponse != nil {
-			builder.WriteString(formatFunctionResponseForConsole(part.FunctionResponse))
+			builder.WriteString(formatFunctionResponseForConsole(agentName, part.FunctionResponse))
 		}
 	}
 	return builder.String()
@@ -491,28 +508,65 @@ func contentPlainText(content *genai.Content) string {
 	return builder.String()
 }
 
-func formatFunctionResponseForConsole(resp *genai.FunctionResponse) string {
-	if resp == nil {
+func formatFunctionCallForConsole(agentName string, call *genai.FunctionCall) string {
+	if call == nil {
 		return ""
 	}
-	if resp.Name != "write_todo" {
+	return fmt.Sprintf("\n\n[TOOL CALL][agent=%s][tool=%s]\n%s\n", displayAgentName(agentName), call.Name, truncateForConsole(mustJSONForConsole(call.Args), 600))
+}
+
+func formatFunctionResponseForConsole(agentName string, resp *genai.FunctionResponse) string {
+	if resp == nil {
 		return ""
 	}
 
 	var builder strings.Builder
-	builder.WriteString("\n\n[Todo List Updated]\n")
+	if resp.Name == "write_todo" {
+		builder.WriteString(fmt.Sprintf("\n\n[TOOL RESPONSE][agent=%s][tool=write_todo]\n", displayAgentName(agentName)))
 
-	if todoList, ok := resp.Response["todo_list"].(string); ok && strings.TrimSpace(todoList) != "" {
-		builder.WriteString(todoList)
+		if todoList, ok := resp.Response["todo_list"].(string); ok && strings.TrimSpace(todoList) != "" {
+			builder.WriteString(todoList)
+			builder.WriteString("\n")
+			return builder.String()
+		}
+
+		if total, ok := resp.Response["total_items"]; ok {
+			builder.WriteString(fmt.Sprintf("Total items: %v\n", total))
+			return builder.String()
+		}
+
+		builder.WriteString("(todo list updated)\n")
+		return builder.String()
+	}
+
+	builder.WriteString(fmt.Sprintf("\n\n[TOOL RESPONSE][agent=%s][tool=%s]\n", displayAgentName(agentName), resp.Name))
+	builder.WriteString(truncateForConsole(mustJSONForConsole(resp.Response), 600))
+	if !strings.HasSuffix(builder.String(), "\n") {
 		builder.WriteString("\n")
-		return builder.String()
 	}
-
-	if total, ok := resp.Response["total_items"]; ok {
-		builder.WriteString(fmt.Sprintf("Total items: %v\n", total))
-		return builder.String()
-	}
-
-	builder.WriteString("(todo list updated)\n")
 	return builder.String()
+}
+
+func displayAgentName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "unknown"
+	}
+	return name
+}
+
+func mustJSONForConsole(value any) string {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return fmt.Sprintf("%v", value)
+	}
+	return string(data)
+}
+
+func truncateForConsole(text string, max int) string {
+	text = strings.TrimSpace(text)
+	if max <= 0 || len(text) <= max {
+		return text
+	}
+	return text[:max] + "\n...(truncated)"
 }

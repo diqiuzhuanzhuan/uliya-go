@@ -18,6 +18,7 @@ const (
 )
 
 type WriteTodoTool struct{}
+type ReadTodoTool struct{}
 
 type TodoItem struct {
 	Content    string `json:"content"`
@@ -29,7 +30,7 @@ type writeTodoArgs struct {
 	Todos []TodoItem `json:"todos"`
 }
 
-type writeTodoResult struct {
+type WriteTodoResult struct {
 	Todos      []TodoItem     `json:"todos"`
 	TodoList   string         `json:"todo_list"`
 	Counts     map[string]int `json:"counts"`
@@ -37,16 +38,18 @@ type writeTodoResult struct {
 }
 
 func New() []tool.Tool {
-	return []tool.Tool{&WriteTodoTool{}}
+	return []tool.Tool{&WriteTodoTool{}, &ReadTodoTool{}}
 }
 
 func (t *WriteTodoTool) Name() string { return "write_todo" }
+func (t *ReadTodoTool) Name() string  { return "read_todo" }
 
 func (t *WriteTodoTool) Description() string {
 	return "Replace the current todo list for this session. Use this only after the task is concrete enough to execute, especially for file-organization work where you should already know the target path and the organization strategy, or have already inspected the path and formed a concrete plan. Do not use this at the start of a vague request, do not use it before the user has identified what directory or file should be organized, and do not use it just because a task might become multi-step. Send the full current list each time, not just the changed item. Valid statuses are pending, in_progress, and completed."
 }
 
 func (t *WriteTodoTool) IsLongRunning() bool { return false }
+func (t *ReadTodoTool) IsLongRunning() bool  { return false }
 
 func (t *WriteTodoTool) Declaration() *genai.FunctionDeclaration {
 	return &genai.FunctionDeclaration{
@@ -112,6 +115,48 @@ func (t *WriteTodoTool) ProcessRequest(ctx tool.Context, req *model.LLMRequest) 
 	return nil
 }
 
+func (t *ReadTodoTool) Description() string {
+	return "Read the current todo list for this session. Use this when you need to inspect current progress before updating it with write_todo."
+}
+
+func (t *ReadTodoTool) Declaration() *genai.FunctionDeclaration {
+	return &genai.FunctionDeclaration{
+		Name:        t.Name(),
+		Description: t.Description(),
+		ParametersJsonSchema: map[string]any{
+			"type":                 "object",
+			"properties":           map[string]any{},
+			"additionalProperties": false,
+		},
+	}
+}
+
+func (t *ReadTodoTool) ProcessRequest(ctx tool.Context, req *model.LLMRequest) error {
+	if req == nil {
+		return fmt.Errorf("request is nil")
+	}
+	if req.Tools == nil {
+		req.Tools = make(map[string]any)
+	}
+	if _, exists := req.Tools[t.Name()]; exists {
+		return fmt.Errorf("duplicate tool: %s", t.Name())
+	}
+	req.Tools[t.Name()] = t
+	if req.Config == nil {
+		req.Config = &genai.GenerateContentConfig{}
+	}
+	for _, candidate := range req.Config.Tools {
+		if candidate != nil && candidate.FunctionDeclarations != nil {
+			candidate.FunctionDeclarations = append(candidate.FunctionDeclarations, t.Declaration())
+			return nil
+		}
+	}
+	req.Config.Tools = append(req.Config.Tools, &genai.Tool{
+		FunctionDeclarations: []*genai.FunctionDeclaration{t.Declaration()},
+	})
+	return nil
+}
+
 func (t *WriteTodoTool) Run(ctx tool.Context, args any) (map[string]any, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("tool context is required")
@@ -120,7 +165,18 @@ func (t *WriteTodoTool) Run(ctx tool.Context, args any) (map[string]any, error) 
 	if err != nil {
 		return nil, err
 	}
-	result, err := writeTodos(ctx.State(), input.Todos)
+	result, err := ReplaceTodos(ctx.State(), input.Todos)
+	if err != nil {
+		return nil, err
+	}
+	return toMap(result)
+}
+
+func (t *ReadTodoTool) Run(ctx tool.Context, args any) (map[string]any, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("tool context is required")
+	}
+	result, err := Snapshot(ctx.State())
 	if err != nil {
 		return nil, err
 	}
@@ -142,9 +198,9 @@ func decodeArgs(raw any) (writeTodoArgs, error) {
 	return input, nil
 }
 
-func writeTodos(state session.State, todos []TodoItem) (writeTodoResult, error) {
+func ReplaceTodos(state session.State, todos []TodoItem) (WriteTodoResult, error) {
 	if state == nil {
-		return writeTodoResult{}, fmt.Errorf("session state is not available")
+		return WriteTodoResult{}, fmt.Errorf("session state is not available")
 	}
 
 	normalized := make([]TodoItem, 0, len(todos))
@@ -157,7 +213,7 @@ func writeTodos(state session.State, todos []TodoItem) (writeTodoResult, error) 
 	for i, item := range todos {
 		content := strings.TrimSpace(item.Content)
 		if content == "" {
-			return writeTodoResult{}, fmt.Errorf("todos[%d].content is required", i)
+			return WriteTodoResult{}, fmt.Errorf("todos[%d].content is required", i)
 		}
 
 		status := strings.TrimSpace(item.Status)
@@ -167,7 +223,7 @@ func writeTodos(state session.State, todos []TodoItem) (writeTodoResult, error) 
 		switch status {
 		case "pending", "in_progress", "completed":
 		default:
-			return writeTodoResult{}, fmt.Errorf("todos[%d].status must be pending, in_progress, or completed", i)
+			return WriteTodoResult{}, fmt.Errorf("todos[%d].status must be pending, in_progress, or completed", i)
 		}
 
 		activeForm := strings.TrimSpace(item.ActiveForm)
@@ -184,25 +240,50 @@ func writeTodos(state session.State, todos []TodoItem) (writeTodoResult, error) 
 	}
 
 	if counts["in_progress"] > 1 {
-		return writeTodoResult{}, fmt.Errorf("only one todo item can be in_progress at a time")
+		return WriteTodoResult{}, fmt.Errorf("only one todo item can be in_progress at a time")
 	}
 
 	rendered := renderTodoList(normalized)
 	if err := state.Set(stateKeyTodoItems, normalized); err != nil {
-		return writeTodoResult{}, fmt.Errorf("save todo_items: %w", err)
+		return WriteTodoResult{}, fmt.Errorf("save todo_items: %w", err)
 	}
 	if err := state.Set(stateKeyTodoList, rendered); err != nil {
-		return writeTodoResult{}, fmt.Errorf("save todo_list: %w", err)
+		return WriteTodoResult{}, fmt.Errorf("save todo_list: %w", err)
 	}
 	if err := clearRefreshReminder(state); err != nil {
-		return writeTodoResult{}, fmt.Errorf("clear todo refresh reminder: %w", err)
+		return WriteTodoResult{}, fmt.Errorf("clear todo refresh reminder: %w", err)
 	}
 
-	return writeTodoResult{
+	return WriteTodoResult{
 		Todos:      normalized,
 		TodoList:   rendered,
 		Counts:     counts,
 		TotalItems: len(normalized),
+	}, nil
+}
+
+func ClearTodos(state session.State) (WriteTodoResult, error) {
+	return ReplaceTodos(state, nil)
+}
+
+func Snapshot(state session.ReadonlyState) (WriteTodoResult, error) {
+	todos, err := LoadTodos(state)
+	if err != nil {
+		return WriteTodoResult{}, err
+	}
+	counts := map[string]int{
+		"pending":     0,
+		"in_progress": 0,
+		"completed":   0,
+	}
+	for _, item := range todos {
+		counts[item.Status]++
+	}
+	return WriteTodoResult{
+		Todos:      todos,
+		TodoList:   renderTodoList(todos),
+		Counts:     counts,
+		TotalItems: len(todos),
 	}, nil
 }
 
@@ -270,6 +351,19 @@ func ActiveTodo(state session.ReadonlyState) (*TodoItem, error) {
 	return nil, nil
 }
 
+func EnsureAllCompleted(state session.ReadonlyState) error {
+	todos, err := LoadTodos(state)
+	if err != nil {
+		return err
+	}
+	for _, item := range todos {
+		if item.Status != "completed" {
+			return fmt.Errorf("todo item is not completed: %s (%s)", item.Content, item.Status)
+		}
+	}
+	return nil
+}
+
 func MarkRefreshNeeded(state session.State, toolName string) error {
 	if state == nil {
 		return fmt.Errorf("session state is not available")
@@ -293,7 +387,19 @@ func clearRefreshReminder(state session.State) error {
 	return state.Set(stateKeyTodoRefreshReminder, "")
 }
 
-func toMap(result writeTodoResult) (map[string]any, error) {
+func RefreshReminder(state session.ReadonlyState) (string, error) {
+	if state == nil {
+		return "", fmt.Errorf("session state is not available")
+	}
+	value, err := state.Get(stateKeyTodoRefreshReminder)
+	if err != nil || value == nil {
+		return "", err
+	}
+	text, _ := value.(string)
+	return text, nil
+}
+
+func toMap(result WriteTodoResult) (map[string]any, error) {
 	data, err := json.Marshal(result)
 	if err != nil {
 		return nil, err

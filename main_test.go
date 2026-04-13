@@ -26,3 +26,22 @@ func TestHasConcreteTaskValuesRequiresBothPathAndIntent(t *testing.T) {
 		t.Fatal("expected path and intent to be accepted")
 	}
 }
+
+func TestHasConcreteTaskDefinitionRequiresStateValues(t *testing.T) {
+	state := newWorkflowTestState()
+	if hasConcreteTaskDefinition(state) {
+		t.Fatal("expected empty state to be non-concrete")
+	}
+	if err := state.Set(stateKeyTargetPath, "/Users/ugreen/Downloads"); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	if hasConcreteTaskDefinition(state) {
+		t.Fatal("expected missing intent in state to be non-concrete")
+	}
+	if err := state.Set(stateKeyOrganizationIntent, "Categorize by filename"); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	if !hasConcreteTaskDefinition(state) {
+		t.Fatal("expected concrete state to be accepted")
+	}
+}

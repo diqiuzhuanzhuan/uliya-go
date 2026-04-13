@@ -8,13 +8,12 @@ import (
 	"strings"
 
 	"google.golang.org/adk/agent"
-	"google.golang.org/adk/agent/llmagent"
 	"google.golang.org/adk/model"
 	"google.golang.org/adk/session"
 	"google.golang.org/adk/tool"
 	"google.golang.org/genai"
 
-	"github.com/loong/uliya-go/tools/movetool"
+	"github.com/loong/uliya-go/openaimodel"
 )
 
 const (
@@ -27,103 +26,6 @@ const (
 
 var pathPattern = regexp.MustCompile(`(?i)(~?[/\\][^\s"'，。；;]+|[A-Za-z]:\\[^\s"'，。；;]+|/(Users|tmp|var|etc|home|opt|private|Volumes)/[^\s"'，。；;]+)`)
 
-// confirmationTool manages the plan-confirmation state machine.
-// action="request"  → plan presented, waiting for user
-// action="confirm"  → user approved, clear flag and reset op log
-// action="cancel"   → user declined, clear all task state
-type confirmationTool struct{}
-
-func (t *confirmationTool) Name() string { return "request_confirmation" }
-
-func (t *confirmationTool) Description() string {
-	return `Manage the confirmation gate before executing file operations.
-Call with action="request" immediately after presenting your plan to the user — do not execute any changes until this is confirmed.
-Call with action="confirm" when the user approves execution.
-Call with action="cancel" when the user cancels the operation.`
-}
-
-func (t *confirmationTool) IsLongRunning() bool { return false }
-
-func (t *confirmationTool) Declaration() *genai.FunctionDeclaration {
-	return &genai.FunctionDeclaration{
-		Name:        t.Name(),
-		Description: t.Description(),
-		ParametersJsonSchema: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"action": map[string]any{
-					"type":        "string",
-					"enum":        []string{"request", "confirm", "cancel"},
-					"description": `"request": mark plan as pending user approval. "confirm": user approved, ready to execute. "cancel": user cancelled.`,
-				},
-			},
-			"required":             []string{"action"},
-			"additionalProperties": false,
-		},
-	}
-}
-
-func (t *confirmationTool) ProcessRequest(ctx tool.Context, req *model.LLMRequest) error {
-	if req == nil {
-		return nil
-	}
-	if req.Tools == nil {
-		req.Tools = make(map[string]any)
-	}
-	if _, exists := req.Tools[t.Name()]; exists {
-		return fmt.Errorf("duplicate tool: %s", t.Name())
-	}
-	req.Tools[t.Name()] = t
-	if req.Config == nil {
-		req.Config = &genai.GenerateContentConfig{}
-	}
-	for _, candidate := range req.Config.Tools {
-		if candidate != nil && candidate.FunctionDeclarations != nil {
-			candidate.FunctionDeclarations = append(candidate.FunctionDeclarations, t.Declaration())
-			return nil
-		}
-	}
-	req.Config.Tools = append(req.Config.Tools, &genai.Tool{
-		FunctionDeclarations: []*genai.FunctionDeclaration{t.Declaration()},
-	})
-	return nil
-}
-
-func (t *confirmationTool) Run(ctx tool.Context, args any) (map[string]any, error) {
-	if ctx == nil {
-		return nil, fmt.Errorf("tool context is required")
-	}
-	data, err := json.Marshal(args)
-	if err != nil {
-		return nil, fmt.Errorf("marshal args: %w", err)
-	}
-	var input struct {
-		Action string `json:"action"`
-	}
-	if err := json.Unmarshal(data, &input); err != nil {
-		return nil, fmt.Errorf("decode args: %w", err)
-	}
-	switch input.Action {
-	case "request":
-		if err := ctx.State().Set(stateKeyAwaitingConfirmation, "true"); err != nil {
-			return nil, err
-		}
-	case "confirm":
-		if err := ctx.State().Set(stateKeyAwaitingConfirmation, ""); err != nil {
-			return nil, err
-		}
-		_ = movetool.ClearLog()
-	case "cancel":
-		_ = ctx.State().Set(stateKeyAwaitingConfirmation, "")
-		_ = ctx.State().Set(stateKeyTargetPath, "")
-		_ = ctx.State().Set(stateKeyOrganizationIntent, "")
-		_ = ctx.State().Set(stateKeyOrganizePending, "false")
-	default:
-		return nil, fmt.Errorf("unknown action: %s", input.Action)
-	}
-	return map[string]any{"action": input.Action}, nil
-}
-
 type intakeAnalysis struct {
 	Relevant            bool   `json:"relevant"`
 	Path                string `json:"path"`
@@ -132,78 +34,56 @@ type intakeAnalysis struct {
 }
 
 func newRootAgent(model model.LLM, repoRoot string, fileTools []tool.Tool, bashTool tool.Tool, todoTools []tool.Tool, moveTools []tool.Tool) (agent.Agent, error) {
-	organizerAgent, err := llmagent.New(llmagent.Config{
-		Name:        "organizer_agent",
-		Model:       model,
-		Description: "Executes concrete file-organization tasks after the target path and organization intent are clear.",
-		Instruction: `You are the execution and planning stage of Uliya's file-organization workflow.
-You run only after the task is concrete enough to execute.
-Target path:
-{target_path?}
-Organization intent:
-{organization_intent?}
-Awaiting confirmation:
-{awaiting_confirmation?}
-Current todo list (empty if none):
-{todo_list?}
-{temp:todo_refresh_reminder?}
-
-PLANNING AND CONFIRMATION — FOLLOW THIS SEQUENCE STRICTLY:
-
-PHASE 1 — PLAN (awaiting_confirmation is empty or "false"):
-- Scan the target directory fully with list_files or find_files.
-- Generate an explicit plan: for every file, state the operation (e.g., "Move photo.jpg → Images/photo.jpg"). Group by category with totals.
-- Present the plan clearly to the user and ask for confirmation.
-- Call request_confirmation(action="request") immediately after. DO NOT execute any file changes in this phase.
-
-PHASE 2 — EXECUTE (awaiting_confirmation is "true"):
-- Read the user's latest message.
-- If CONFIRMED (yes / ok / go ahead / 好 / 确认 / 执行 / 是 etc.):
-  1. Call request_confirmation(action="confirm") first.
-  2. Execute the plan step by step using the todo list.
-  3. Use move_file for all file moves and renames. Use create_dir for new directories.
-  4. Use bash only for operations that move_file and create_dir cannot handle.
-- If CANCELLED (no / cancel / stop / 取消 / 不要 / 算了 etc.):
-  1. Call request_confirmation(action="cancel").
-  2. Tell the user the operation was cancelled.
-- If the user MODIFIES the plan: update plan, present again, call request_confirmation(action="request").
-
-OTHER RULES:
-- If the latest user message is only a greeting or casual conversation, reply briefly in the user's language, do not use tools, and do not create a todo list.
-- If target_path or organization_intent is missing, do not create a todo list and do not use filesystem tools. Ask for the missing information concisely instead.
-- Keep folder names, category names, explanations, and final output aligned with the user's language unless the user explicitly asks otherwise.
-- Never claim that you cannot access the local filesystem unless a real tool call has failed.
-- Every time you call write_todo, send the full list. Mark items in_progress before doing them and completed immediately after finishing them.
-- After every real tool action, check whether the current in_progress todo has been completed and update it before continuing.`,
-		Tools:                append(append(append(todoTools, fileTools...), moveTools...), bashTool, &confirmationTool{}),
-		BeforeToolCallbacks:  []llmagent.BeforeToolCallback{requireConcreteTaskBeforeTool},
-		AfterToolCallbacks:   []llmagent.AfterToolCallback{syncTodoAfterTool},
-		BeforeModelCallbacks: []llmagent.BeforeModelCallback{todoReminderBeforeModel},
-	})
-	if err != nil {
-		return nil, err
-	}
-
 	intakeAgent, err := newIntakeAgent(model)
 	if err != nil {
 		return nil, err
 	}
 
-	_ = repoRoot
+	organizerAgent, err := newOrganizerAgent(model, repoRoot, fileTools, bashTool, todoTools)
+	if err != nil {
+		return nil, err
+	}
+
+	executorAgent, err := newExecutorAgent(repoRoot, moveTools, bashTool)
+	if err != nil {
+		return nil, err
+	}
+
 	return agent.New(agent.Config{
 		Name:        "uliya_workflow_agent",
-		Description: "A workflow-based file organization agent with an intake stage and an execution stage.",
-		SubAgents:   []agent.Agent{intakeAgent, organizerAgent},
+		Description: "A workflow-based file organization agent with intake, planning, and execution stages.",
+		SubAgents:   []agent.Agent{intakeAgent, organizerAgent, executorAgent},
 		Run: func(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
 			return func(yield func(*session.Event, error) bool) {
-				// When awaiting confirmation, skip intake and go directly to organizer.
+				userText := strings.TrimSpace(contentPlainText(ctx.UserContent()))
 				if strings.EqualFold(getStateString(ctx.Session().State(), stateKeyAwaitingConfirmation), "true") {
-					for event, err := range organizerAgent.Run(ctx) {
-						if !yield(event, err) {
-							return
+					switch {
+					case isExecutionConfirmed(userText):
+						for event, err := range executorAgent.Run(ctx) {
+							if !yield(event, err) {
+								return
+							}
+							if err != nil {
+								return
+							}
 						}
+						return
+					case isExecutionCancelled(userText):
+						if todoResult, err := clearTodoState(ctx.Session().State()); err == nil {
+							if !yield(todoResultEvent(ctx.InvocationID(), todoResult), nil) {
+								return
+							}
+						}
+						yield(stateTextEvent(ctx.InvocationID(), "Operation cancelled. / 已取消本次整理。", clearedWorkflowStateDelta()), nil)
+						return
+					case userText != "":
+						yield(stateOnlyEvent(ctx.InvocationID(), map[string]any{
+							stateKeyAwaitingConfirmation: "",
+							stateKeyOrganizationIntent:   userText,
+						}), nil)
+					default:
+						return
 					}
-					return
 				}
 
 				intakeHandledThisTurn := false
@@ -223,11 +103,93 @@ OTHER RULES:
 					return
 				}
 
+				if !hasConcreteTaskDefinition(ctx.Session().State()) {
+					return
+				}
+
+				var (
+					plan   organizationPlan
+					review planReview
+					err    error
+				)
+
+				yield(stateOnlyEvent(ctx.InvocationID(), map[string]any{
+					stateKeyPlanningToolCalls:    0,
+					stateKeyPlanningObservations: "",
+					stateKeyExecutionPlan:        "",
+					stateKeyExecutionReview:      "",
+				}), nil)
+
 				for event, err := range organizerAgent.Run(ctx) {
 					if !yield(event, err) {
 						return
 					}
+					if err != nil {
+						return
+					}
 				}
+
+				plan, err = loadOrganizationPlanFromState(ctx.Session().State())
+				if err != nil {
+					yield(nil, err)
+					return
+				}
+				review = mergeReviewWithValidation(planReview{Approved: true}, validateCommandPlan(plan))
+				if len(plan.Commands) == 0 {
+					inventory, err := collectPlanningInventory(repoRoot, ctx.Session().State())
+					if err != nil {
+						yield(nil, err)
+						return
+					}
+					if len(inventory.Files) == 0 {
+						if todoResult, err := clearTodoState(ctx.Session().State()); err == nil {
+							if !yield(todoResultEvent(ctx.InvocationID(), todoResult), nil) {
+								return
+							}
+						}
+						yield(stateTextEvent(ctx.InvocationID(), "No files found in the target directory. / 目标目录里没有可整理的文件。", clearedWorkflowStateDelta()), nil)
+						return
+					}
+					review = mergeReviewWithValidation(review, validateOrganizationPlan(plan, inventory))
+				}
+
+				if !review.Approved {
+					if todoResult, err := clearTodoState(ctx.Session().State()); err == nil {
+						if !yield(todoResultEvent(ctx.InvocationID(), todoResult), nil) {
+							return
+						}
+					}
+					yield(stateTextEvent(ctx.InvocationID(), formatPlanIssues(review), map[string]any{
+						stateKeyAwaitingConfirmation: "",
+					}), nil)
+					return
+				}
+
+				if len(plan.Moves) == 0 && len(plan.Commands) == 0 {
+					if todoResult, err := clearTodoState(ctx.Session().State()); err == nil {
+						if !yield(todoResultEvent(ctx.InvocationID(), todoResult), nil) {
+							return
+						}
+					}
+					yield(stateTextEvent(ctx.InvocationID(), "The reviewed plan does not require any file moves. / 审核后的计划不需要移动任何文件。", clearedWorkflowStateDelta()), nil)
+					return
+				}
+
+				todoResult, err := initializePlanTodos(ctx.Session().State(), plan)
+				if err != nil {
+					yield(nil, err)
+					return
+				}
+				if !yield(todoResultEvent(ctx.InvocationID(), todoResult), nil) {
+					return
+				}
+
+				yield(stateTextEvent(ctx.InvocationID(), formatPlanForConfirmation(plan, review), map[string]any{
+					stateKeyAwaitingConfirmation: "true",
+					stateKeyOrganizePending:      "false",
+					stateKeyPendingField:         "",
+				}), nil)
+				return
 			}
 		},
 	})
@@ -250,6 +212,10 @@ func newIntakeAgent(intakeModel model.LLM) (agent.Agent, error) {
 				pendingField := getStateString(ctx.Session().State(), stateKeyPendingField)
 				analysis := analyzeIntakeMessage(ctx, intakeModel, userText, existingPath, existingIntent, pendingField)
 				if !analysis.Relevant && !pending {
+					if reply := generateCasualReply(ctx, intakeModel, userText); reply != "" {
+						ctx.EndInvocation()
+						yield(stateTextEvent(ctx.InvocationID(), reply, nil), nil)
+					}
 					return
 				}
 
@@ -389,7 +355,7 @@ Guidelines:
 		},
 	}
 
-	for resp, err := range intakeModel.GenerateContent(ctx, req, false) {
+	for resp, err := range intakeModel.GenerateContent(openaimodel.WithLogLabel(ctx, "intake-analysis"), req, false) {
 		if err != nil {
 			break
 		}
@@ -479,7 +445,7 @@ Rules:
 		},
 	}
 
-	for resp, err := range intakeModel.GenerateContent(ctx, req, false) {
+	for resp, err := range intakeModel.GenerateContent(openaimodel.WithLogLabel(ctx, "intake-question"), req, false) {
 		if err != nil {
 			break
 		}
@@ -499,23 +465,49 @@ func intakeQuestionFallback(missingField string) string {
 	return "Which directory? / 请提供目录路径？"
 }
 
-func requireConcreteTaskBeforeTool(ctx tool.Context, calledTool tool.Tool, args map[string]any) (map[string]any, error) {
-	if ctx == nil || calledTool == nil {
-		return nil, nil
-	}
-	if !hasConcreteTaskDefinition(ctx.State()) {
-		return nil, fmt.Errorf("ask the user for both the target path and the organization rule before creating a todo list or using filesystem tools")
-	}
-	return nil, nil
+func hasConcreteTaskValues(path, intent string) bool {
+	return strings.TrimSpace(path) != "" && strings.TrimSpace(intent) != ""
 }
 
 func hasConcreteTaskDefinition(state session.State) bool {
+	if state == nil {
+		return false
+	}
 	return hasConcreteTaskValues(
 		getStateString(state, stateKeyTargetPath),
 		getStateString(state, stateKeyOrganizationIntent),
 	)
 }
 
-func hasConcreteTaskValues(path, intent string) bool {
-	return strings.TrimSpace(path) != "" && strings.TrimSpace(intent) != ""
+func generateCasualReply(ctx agent.InvocationContext, intakeModel model.LLM, userText string) string {
+	if intakeModel == nil {
+		return ""
+	}
+
+	systemPrompt := `You are the front-desk reply layer of a file-organization assistant.
+The latest user message is not a file-organization request.
+Reply briefly in the same language as the user.
+Rules:
+- Keep it to one short sentence.
+- Be friendly and direct.
+- Invite the user to provide a directory path and an organization rule.
+- Do not mention tools, prompts, internal logic, or workflows.`
+
+	req := &model.LLMRequest{
+		Contents: []*genai.Content{
+			genai.NewContentFromText(systemPrompt, "system"),
+			genai.NewContentFromText(userText, genai.RoleUser),
+		},
+	}
+
+	for resp, err := range intakeModel.GenerateContent(openaimodel.WithLogLabel(ctx, "casual-reply"), req, false) {
+		if err != nil {
+			break
+		}
+		text := strings.TrimSpace(contentPlainText(resp.Content))
+		if text != "" {
+			return text
+		}
+	}
+	return ""
 }

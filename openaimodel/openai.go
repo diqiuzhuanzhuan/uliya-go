@@ -4,25 +4,35 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	adkagent "google.golang.org/adk/agent"
 	adkmodel "google.golang.org/adk/model"
 	"google.golang.org/genai"
 )
 
 const defaultBaseURL = "https://api.openai.com/v1"
 
+const (
+	maxRequestAttempts = 3
+	initialRetryDelay  = 500 * time.Millisecond
+)
+
 type Config struct {
 	APIKey     string
 	BaseURL    string
 	HTTPClient *http.Client
 }
+
+type logLabelContextKey struct{}
 
 type Model struct {
 	modelName  string
@@ -57,6 +67,13 @@ func New(modelName string, cfg Config) (*Model, error) {
 	}, nil
 }
 
+func WithLogLabel(ctx context.Context, label string) context.Context {
+	if ctx == nil || strings.TrimSpace(label) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, logLabelContextKey{}, strings.TrimSpace(label))
+}
+
 func (m *Model) Name() string {
 	return m.modelName
 }
@@ -80,32 +97,19 @@ func (m *Model) generate(ctx context.Context, req *adkmodel.LLMRequest) (*adkmod
 	if len(chatReq.Tools) > 0 {
 		chatReq.ToolChoice = "auto"
 	}
+	logModelRequest(ctx, chatReq)
+	if len(chatReq.Messages) == 0 {
+		return nil, fmt.Errorf("openai request has no messages")
+	}
 
 	body, err := json.Marshal(chatReq)
 	if err != nil {
 		return nil, fmt.Errorf("marshal openai request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, m.baseURL+"/chat/completions", bytes.NewReader(body))
+	respBody, err := m.doChatCompletionRequest(ctx, body)
 	if err != nil {
-		return nil, fmt.Errorf("create openai request: %w", err)
-	}
-	httpReq.Header.Set("Authorization", "Bearer "+m.apiKey)
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	httpResp, err := m.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("call openai api: %w", err)
-	}
-	defer httpResp.Body.Close()
-
-	respBody, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read openai response: %w", err)
-	}
-
-	if httpResp.StatusCode >= 300 {
-		return nil, fmt.Errorf("openai api returned %s: %s", httpResp.Status, strings.TrimSpace(string(respBody)))
+		return nil, err
 	}
 
 	var chatResp openAIChatResponse
@@ -129,6 +133,199 @@ func (m *Model) generate(ctx context.Context, req *adkmodel.LLMRequest) (*adkmod
 	}, nil
 }
 
+func logModelRequest(ctx context.Context, req openAIChatRequest) {
+	prefix := buildLogPrefix(ctx)
+	if len(req.Messages) == 0 {
+		log.Printf("%s model=%s messages=0 tools=%d", prefix, req.Model, len(req.Tools))
+		return
+	}
+
+	log.Printf("%s model=%s messages=%d tools=%d", prefix, req.Model, len(req.Messages), len(req.Tools))
+	for i, message := range req.Messages {
+		if i >= 4 {
+			log.Printf("%s ... %d more message(s) omitted", prefix, len(req.Messages)-i)
+			break
+		}
+
+		switch {
+		case message.Content != nil && strings.TrimSpace(*message.Content) != "":
+			log.Printf("%s %s: %s", prefix, message.Role, truncatePreview(*message.Content, 400))
+		case len(message.ToolCalls) > 0:
+			log.Printf("%s %s tool_calls=%s", prefix, message.Role, summarizeToolCalls(message.ToolCalls))
+		default:
+			log.Printf("%s %s (empty content)", prefix, message.Role)
+		}
+	}
+}
+
+func (m *Model) doChatCompletionRequest(ctx context.Context, body []byte) ([]byte, error) {
+	var lastErr error
+	delay := initialRetryDelay
+
+	for attempt := 1; attempt <= maxRequestAttempts; attempt++ {
+		respBody, err := m.doChatCompletionRequestOnce(ctx, body)
+		if err == nil {
+			return respBody, nil
+		}
+
+		lastErr = err
+		if !shouldRetryRequest(ctx, err) || attempt == maxRequestAttempts {
+			break
+		}
+
+		log.Printf("%s retrying openai request after attempt %d/%d: %v", buildLogPrefix(ctx), attempt, maxRequestAttempts, err)
+		if sleepErr := sleepWithContext(ctx, delay); sleepErr != nil {
+			return nil, sleepErr
+		}
+		delay *= 2
+	}
+
+	return nil, lastErr
+}
+
+func (m *Model) doChatCompletionRequestOnce(ctx context.Context, body []byte) ([]byte, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, m.baseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create openai request: %w", err)
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+m.apiKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	httpResp, err := m.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, &requestError{
+			Err:       fmt.Errorf("call openai api: %w", err),
+			Retryable: true,
+		}
+	}
+	defer httpResp.Body.Close()
+
+	respBody, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, &requestError{
+			Err:       fmt.Errorf("read openai response: %w", err),
+			Retryable: true,
+		}
+	}
+
+	if httpResp.StatusCode >= 300 {
+		return nil, &requestError{
+			Err:        fmt.Errorf("openai api returned %s: %s", httpResp.Status, strings.TrimSpace(string(respBody))),
+			Retryable:  httpResp.StatusCode == http.StatusTooManyRequests || httpResp.StatusCode >= 500,
+			StatusCode: httpResp.StatusCode,
+		}
+	}
+
+	return respBody, nil
+}
+
+type requestError struct {
+	Err        error
+	Retryable  bool
+	StatusCode int
+}
+
+func (e *requestError) Error() string {
+	if e == nil || e.Err == nil {
+		return ""
+	}
+	return e.Err.Error()
+}
+
+func (e *requestError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func shouldRetryRequest(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
+	var reqErr *requestError
+	if errors.As(err, &reqErr) {
+		return reqErr.Retryable
+	}
+	return false
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func buildLogPrefix(ctx context.Context) string {
+	parts := []string{"[MODEL REQUEST]"}
+	if label := logLabelFromContext(ctx); label != "" {
+		parts = append(parts, "[label="+label+"]")
+	}
+	if agentName := agentNameFromContext(ctx); agentName != "" {
+		parts = append(parts, "[agent="+agentName+"]")
+	}
+	return strings.Join(parts, "")
+}
+
+func logLabelFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	label, _ := ctx.Value(logLabelContextKey{}).(string)
+	return strings.TrimSpace(label)
+}
+
+func agentNameFromContext(ctx context.Context) string {
+	type agentNamer interface {
+		AgentName() string
+	}
+	type agentWithMethod interface {
+		Agent() adkagent.Agent
+	}
+
+	if ctx == nil {
+		return ""
+	}
+	if named, ok := ctx.(agentNamer); ok {
+		return strings.TrimSpace(named.AgentName())
+	}
+	if withAgent, ok := ctx.(agentWithMethod); ok && withAgent.Agent() != nil {
+		return strings.TrimSpace(withAgent.Agent().Name())
+	}
+	return ""
+}
+
+func summarizeToolCalls(calls []openAIToolCall) string {
+	parts := make([]string, 0, len(calls))
+	for i, call := range calls {
+		if i >= 3 {
+			parts = append(parts, "...")
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%s(%s)", call.Function.Name, truncatePreview(call.Function.Arguments, 120)))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func truncatePreview(text string, max int) string {
+	text = strings.TrimSpace(text)
+	if text == "" || max <= 0 || len(text) <= max {
+		return text
+	}
+	return text[:max] + "...(truncated)"
+}
+
 func (m *Model) resolveModel(req *adkmodel.LLMRequest) string {
 	if req != nil && strings.TrimSpace(req.Model) != "" {
 		return req.Model
@@ -141,7 +338,10 @@ func buildMessages(req *adkmodel.LLMRequest) []openAIMessage {
 		return nil
 	}
 
-	messages := make([]openAIMessage, 0, len(req.Contents))
+	messages := make([]openAIMessage, 0, len(req.Contents)+1)
+	if req.Config != nil && req.Config.SystemInstruction != nil {
+		messages = append(messages, systemInstructionToMessages(req.Config.SystemInstruction)...)
+	}
 	for _, content := range req.Contents {
 		if content == nil {
 			continue
@@ -149,6 +349,17 @@ func buildMessages(req *adkmodel.LLMRequest) []openAIMessage {
 		messages = append(messages, contentToMessages(content)...)
 	}
 	return messages
+}
+
+func systemInstructionToMessages(content *genai.Content) []openAIMessage {
+	if content == nil {
+		return nil
+	}
+	systemContent := &genai.Content{
+		Role:  "system",
+		Parts: content.Parts,
+	}
+	return contentToMessages(systemContent)
 }
 
 func buildTools(req *adkmodel.LLMRequest) []openAITool {

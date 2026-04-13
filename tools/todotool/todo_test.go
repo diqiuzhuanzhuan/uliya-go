@@ -39,7 +39,7 @@ func (s *testState) All() iter.Seq2[string, any] {
 
 func TestWriteTodosStoresRenderedListInState(t *testing.T) {
 	state := newTestState()
-	result, err := writeTodos(state, []TodoItem{
+	result, err := ReplaceTodos(state, []TodoItem{
 		{Content: "Inspect Downloads", Status: "completed"},
 		{Content: "Group screenshots", Status: "in_progress", ActiveForm: "Grouping screenshots by project"},
 		{Content: "Move archives", Status: "pending"},
@@ -64,7 +64,7 @@ func TestWriteTodosStoresRenderedListInState(t *testing.T) {
 
 func TestWriteTodosDefaultsPendingStatus(t *testing.T) {
 	state := newTestState()
-	result, err := writeTodos(state, []TodoItem{
+	result, err := ReplaceTodos(state, []TodoItem{
 		{Content: "Create folders"},
 	})
 	if err != nil {
@@ -75,9 +75,30 @@ func TestWriteTodosDefaultsPendingStatus(t *testing.T) {
 	}
 }
 
+func TestSnapshotReturnsCurrentTodoState(t *testing.T) {
+	state := newTestState()
+	if _, err := ReplaceTodos(state, []TodoItem{
+		{Content: "Inspect files", Status: "completed"},
+		{Content: "Move files", Status: "pending"},
+	}); err != nil {
+		t.Fatalf("ReplaceTodos() error = %v", err)
+	}
+
+	result, err := Snapshot(state)
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	if result.TotalItems != 2 || result.Counts["completed"] != 1 || result.Counts["pending"] != 1 {
+		t.Fatalf("unexpected snapshot result: %#v", result)
+	}
+	if !strings.Contains(result.TodoList, "[x] Inspect files") || !strings.Contains(result.TodoList, "[ ] Move files") {
+		t.Fatalf("unexpected snapshot todo list: %q", result.TodoList)
+	}
+}
+
 func TestWriteTodosRejectsMultipleInProgressItems(t *testing.T) {
 	state := newTestState()
-	_, err := writeTodos(state, []TodoItem{
+	_, err := ReplaceTodos(state, []TodoItem{
 		{Content: "A", Status: "in_progress"},
 		{Content: "B", Status: "in_progress"},
 	})
@@ -91,7 +112,7 @@ func TestWriteTodosRejectsMultipleInProgressItems(t *testing.T) {
 
 func TestWriteTodosRejectsInvalidStatus(t *testing.T) {
 	state := newTestState()
-	_, err := writeTodos(state, []TodoItem{
+	_, err := ReplaceTodos(state, []TodoItem{
 		{Content: "A", Status: "doing"},
 	})
 	if err == nil {
@@ -104,7 +125,7 @@ func TestWriteTodosRejectsInvalidStatus(t *testing.T) {
 
 func TestMarkRefreshNeededSetsReminderForActiveTodo(t *testing.T) {
 	state := newTestState()
-	if _, err := writeTodos(state, []TodoItem{
+	if _, err := ReplaceTodos(state, []TodoItem{
 		{Content: "Inspect files", Status: "in_progress", ActiveForm: "Inspecting files"},
 		{Content: "Move files", Status: "pending"},
 	}); err != nil {
@@ -124,7 +145,7 @@ func TestMarkRefreshNeededSetsReminderForActiveTodo(t *testing.T) {
 
 func TestMarkRefreshNeededClearsReminderWhenNoActiveTodo(t *testing.T) {
 	state := newTestState()
-	if _, err := writeTodos(state, []TodoItem{
+	if _, err := ReplaceTodos(state, []TodoItem{
 		{Content: "Inspect files", Status: "completed"},
 	}); err != nil {
 		t.Fatalf("writeTodos() error = %v", err)
@@ -137,5 +158,38 @@ func TestMarkRefreshNeededClearsReminderWhenNoActiveTodo(t *testing.T) {
 	got, _ := state.Get(stateKeyTodoRefreshReminder)
 	if got.(string) != "" {
 		t.Fatalf("expected empty reminder, got %q", got.(string))
+	}
+}
+
+func TestRefreshReminderReadsCurrentReminder(t *testing.T) {
+	state := newTestState()
+	if err := state.Set(stateKeyTodoRefreshReminder, "refresh me"); err != nil {
+		t.Fatalf("state.Set() error = %v", err)
+	}
+
+	reminder, err := RefreshReminder(state)
+	if err != nil {
+		t.Fatalf("RefreshReminder() error = %v", err)
+	}
+	if reminder != "refresh me" {
+		t.Fatalf("expected reminder to round-trip, got %q", reminder)
+	}
+}
+
+func TestEnsureAllCompletedRejectsPendingItems(t *testing.T) {
+	state := newTestState()
+	if _, err := ReplaceTodos(state, []TodoItem{
+		{Content: "Inspect files", Status: "completed"},
+		{Content: "Move files", Status: "pending"},
+	}); err != nil {
+		t.Fatalf("ReplaceTodos() error = %v", err)
+	}
+
+	err := EnsureAllCompleted(state)
+	if err == nil {
+		t.Fatal("expected incomplete todo error")
+	}
+	if !strings.Contains(err.Error(), "Move files") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
