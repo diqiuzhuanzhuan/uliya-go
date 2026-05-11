@@ -278,6 +278,8 @@ func runConsole(ctx context.Context, config *launcher.Config, args []string) err
 	if err != nil {
 		return err
 	}
+	sessionUsage := tokenUsageStats{}
+	consoleLanguage := "en"
 
 	fmt.Printf("Current session: %s\n", currentSession.ID())
 	fmt.Println("Commands: /new creates a new chat, /reset clears the current chat, /undo reverses the last execution, /exit quits.")
@@ -312,6 +314,7 @@ func runConsole(ctx context.Context, config *launcher.Config, args []string) err
 			fmt.Print("User -> ")
 			continue
 		}
+		consoleLanguage = detectResponseLanguage(consoleLanguage, userInput)
 
 		switch userInput {
 		case "/undo":
@@ -327,6 +330,7 @@ func runConsole(ctx context.Context, config *launcher.Config, args []string) err
 			if err != nil {
 				return err
 			}
+			sessionUsage = tokenUsageStats{}
 			fmt.Printf("\nStarted new session: %s\n", currentSession.ID())
 			fmt.Print("User -> ")
 			continue
@@ -338,6 +342,7 @@ func runConsole(ctx context.Context, config *launcher.Config, args []string) err
 			if err != nil {
 				return err
 			}
+			sessionUsage = tokenUsageStats{}
 			fmt.Printf("\nReset complete. New session: %s\n", currentSession.ID())
 			fmt.Print("User -> ")
 			continue
@@ -356,6 +361,7 @@ func runConsole(ctx context.Context, config *launcher.Config, args []string) err
 		fmt.Print("\nAgent -> ")
 
 		prevText := ""
+		runUsage := tokenUsageStats{}
 		for event, runErr := range r.Run(ctx, consoleUserID, currentSession.ID(), userMsg, agent.RunConfig{
 			StreamingMode: mode,
 		}) {
@@ -364,8 +370,12 @@ func runConsole(ctx context.Context, config *launcher.Config, args []string) err
 				continue
 			}
 			if event == nil || event.LLMResponse.Content == nil {
+				if event != nil {
+					runUsage.Add(event.LLMResponse.UsageMetadata)
+				}
 				continue
 			}
+			runUsage.Add(event.LLMResponse.UsageMetadata)
 
 			text := contentConsoleOutput(event)
 			if mode != agent.StreamingModeSSE {
@@ -384,8 +394,53 @@ func runConsole(ctx context.Context, config *launcher.Config, args []string) err
 			}
 			prevText = ""
 		}
+		if runUsage.HasData() {
+			sessionUsage.Merge(runUsage)
+			fmt.Printf("\n%s", formatTokenUsageSummary(runUsage, sessionUsage, consoleLanguage == "zh"))
+		}
 		fmt.Print("\nUser -> ")
 	}
+}
+
+type tokenUsageStats struct {
+	Input  int64
+	Output int64
+	Total  int64
+}
+
+func (s *tokenUsageStats) Add(metadata *genai.GenerateContentResponseUsageMetadata) {
+	if s == nil || metadata == nil {
+		return
+	}
+	s.Input += int64(metadata.PromptTokenCount)
+	s.Output += int64(metadata.CandidatesTokenCount)
+	s.Total += int64(metadata.TotalTokenCount)
+}
+
+func (s *tokenUsageStats) Merge(other tokenUsageStats) {
+	if s == nil {
+		return
+	}
+	s.Input += other.Input
+	s.Output += other.Output
+	s.Total += other.Total
+}
+
+func (s tokenUsageStats) HasData() bool {
+	return s.Input > 0 || s.Output > 0 || s.Total > 0
+}
+
+func formatTokenUsageSummary(run, session tokenUsageStats, preferChinese bool) string {
+	if preferChinese {
+		return fmt.Sprintf("[TOKENS] 本轮 输入=%d 输出=%d 总计=%d | 当前会话 输入=%d 输出=%d 总计=%d",
+			run.Input, run.Output, run.Total,
+			session.Input, session.Output, session.Total,
+		)
+	}
+	return fmt.Sprintf("[TOKENS] run input=%d output=%d total=%d | session input=%d output=%d total=%d",
+		run.Input, run.Output, run.Total,
+		session.Input, session.Output, session.Total,
+	)
 }
 
 func runUndo() error {

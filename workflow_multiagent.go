@@ -30,6 +30,10 @@ const (
 	stateKeyPlanningToolCalls      = "planning_tool_calls"
 	stateKeyPlanningObservations   = "planning_observations_json"
 	maxPlanningInspectionToolCalls = 6
+
+	todoContentScan    = "Scan directory and generate plan"
+	todoContentConfirm = "Awaiting your confirmation"
+	todoContentVerify  = "Verify completeness"
 )
 
 type organizationInventory struct {
@@ -71,11 +75,12 @@ type planningObservationRecord struct {
 }
 
 type executionResult struct {
-	Moved      []organizationMove
-	CreatedDir []string
-	Failures   []string
-	TodoList   string
-	Commands   []string
+	Moved        []organizationMove
+	CreatedDir   []string
+	Failures     []string
+	TodoList     string
+	Commands     []string
+	UnmovedFiles []string
 }
 
 type executionStep struct {
@@ -86,8 +91,9 @@ type executionStep struct {
 
 func newOrganizerAgent(planningModel model.LLM, repoRoot string, fileTools []tool.Tool, bashTool tool.Tool, todoTools []tool.Tool) (agent.Agent, error) {
 	_ = repoRoot
+	_ = fileTools
 
-	tools := concatTools(nonNilTools(bashTool), fileTools, todoTools)
+	tools := concatTools(nonNilTools(bashTool), todoTools)
 	return llmagent.New(llmagent.Config{
 		Name:            "organization_agent",
 		Model:           planningModel,
@@ -110,22 +116,39 @@ func newOrganizerAgent(planningModel model.LLM, repoRoot string, fileTools []too
 Return JSON only with this schema:
 {"summary":"string","directories":["string"],"moves":[{"src":"string","dst":"string","reason":"string"}],"commands":["string"],"notes":["string"]}
 
-Rules:
-- First make the task concrete: identify the target directory and the organization intent.
-- For multi-step work, use write_todo to keep a short current plan and progress state.
-- Inspect the directory with tools before deciding on the final plan.
-- Prefer bash for cheap metadata inspection such as find, ls, stat, du, sort, uniq, awk, sed, and cut.
-- Prefer file tools over bash when you need structured file lookups or exact file reads.
-- Do not read file contents unless the user's intent clearly requires semantic/content-based grouping.
+INSPECTION — use the fewest bash calls possible:
+
+For extension-based grouping, start with:
+  find . -type f | awk -F. 'NF>1{print tolower($NF)} NF==1{print "[no extension]"}' | sort | uniq -c
+
+Optionally, if useful for fast summarization, also run:
+  find . -type f | awk -F. 'NF>1{print tolower($NF)} NF==1{print "[no extension]"}' | sort
+
+For name/date-based grouping, start with:
+  find . -type f | sort
+
+Only make additional tool calls when the initial output is insufficient to produce a reliable plan, for example:
+- ambiguous filenames
+- many extensionless files
+- date grouping requires metadata not present in the path list
+- conflict resolution requires additional inspection
+
+Do not read file contents by default. Read limited content only when path, extension, and directory structure are insufficient for reliable grouping.
+If the user's rule is extension-based or file-type based, do not begin by listing all filenames. First inspect only the extension distribution, and prefer batch-safe shell commands grouped by extension over explicit per-file moves when filenames are not otherwise needed.
+
+Planning rules:
 - Do not mutate the filesystem while planning. The planning phase is read-only.
-- Keep inspection tight. After a small number of tool calls, stop and return the final JSON plan instead of continuing to explore.
+- Generate an explicit move entry for every file that needs to be relocated. Do not leave files unaccounted for.
 - Shell commands in the final plan must be macOS/BSD compatible and assume they run from the target directory.
-- Use "commands" for batch-safe operations and "moves" for explicit per-file moves.
+- Use "moves" for explicit per-file moves. Use "commands" only for batch-safe shell operations that cannot be expressed as individual moves.
 - Keep the plan conservative, reversible, and aligned with the user's stated intent.
-- Before returning, self-check for safety: no destructive commands, no writes outside the target directory, and no accidental renames unless the user asked for them.
+- Write all natural-language values in "summary", "reason", and "notes" in the same language as the user.
+- By default, directory names should also follow the user's language. For Chinese requests, prefer names like "文档", "图片", "视频", "按扩展名" instead of "Docs", "Images", "Videos", "by_extension" unless the user explicitly asked for English names.
+- Before returning, self-check: no destructive commands, no writes outside the target directory, no accidental renames unless the user asked for them.
 
 Target path: {target_path?}
-Organization intent: {organization_intent?}`,
+Organization intent: {organization_intent?}
+Preferred reply language: {response_language?}`,
 	})
 }
 
@@ -155,13 +178,13 @@ func newExecutorAgent(repoRoot string, moveTools []tool.Tool, bashTool tool.Tool
 					}
 				}
 				if err != nil {
-					yield(stateTextEvent(ctx.InvocationID(), fmt.Sprintf("Execution stopped: %v", err), map[string]any{
+					yield(stateTextEvent(ctx.InvocationID(), formatExecutionStopped(err, prefersChinese(ctx.Session().State())), map[string]any{
 						stateKeyAwaitingConfirmation: "",
 					}), nil)
 					return
 				}
 
-				yield(stateTextEvent(ctx.InvocationID(), formatExecutionResult(result), clearedWorkflowStateDelta()), nil)
+				yield(stateTextEvent(ctx.InvocationID(), formatExecutionResult(result, prefersChinese(ctx.Session().State())), clearedWorkflowStateDelta()), nil)
 			}
 		},
 	})
@@ -348,7 +371,7 @@ func loadOrganizationPlanFromState(state session.State) (organizationPlan, error
 	if err != nil {
 		return organizationPlan{}, err
 	}
-	return normalizePlan(plan), nil
+	return localizePlanLanguage(normalizePlan(plan), prefersChinese(state)), nil
 }
 
 func loadJSONState[T any](state session.State, key string) (T, error) {
@@ -365,17 +388,156 @@ func loadJSONState[T any](state session.State, key string) (T, error) {
 
 func parseJSONBlock[T any](raw string) (T, error) {
 	var zero T
-	raw = strings.TrimSpace(raw)
-	raw = strings.TrimPrefix(raw, "```json")
-	raw = strings.TrimPrefix(raw, "```")
-	raw = strings.TrimSuffix(raw, "```")
-	raw = strings.TrimSpace(raw)
-
-	var out T
-	if err := json.Unmarshal([]byte(raw), &out); err != nil {
-		return zero, fmt.Errorf("decode json block: %w", err)
+	var firstErr error
+	for _, candidate := range jsonCandidates(raw) {
+		var out T
+		if err := json.Unmarshal([]byte(candidate), &out); err == nil {
+			return out, nil
+		} else if firstErr == nil {
+			firstErr = err
+		}
 	}
-	return out, nil
+	if firstErr != nil {
+		return zero, fmt.Errorf("decode json block: %w", firstErr)
+	}
+	return zero, fmt.Errorf("decode json block: no json object found")
+}
+
+func jsonCandidates(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	candidates := make([]string, 0, 8)
+	seen := make(map[string]struct{})
+	add := func(candidate string) {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			return
+		}
+		if _, ok := seen[candidate]; ok {
+			return
+		}
+		seen[candidate] = struct{}{}
+		candidates = append(candidates, candidate)
+	}
+
+	add(raw)
+	add(trimMarkdownCodeFence(raw))
+	for _, block := range extractMarkdownCodeBlocks(raw) {
+		add(block)
+	}
+	for _, block := range extractInlineJSONValues(raw, 32) {
+		add(block)
+	}
+
+	return candidates
+}
+
+func trimMarkdownCodeFence(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasPrefix(raw, "```") {
+		return raw
+	}
+
+	newline := strings.IndexByte(raw, '\n')
+	if newline < 0 {
+		return raw
+	}
+	end := strings.LastIndex(raw, "```")
+	if end <= newline {
+		return raw
+	}
+	return strings.TrimSpace(raw[newline+1 : end])
+}
+
+func extractMarkdownCodeBlocks(raw string) []string {
+	blocks := make([]string, 0, 2)
+	for {
+		start := strings.Index(raw, "```")
+		if start < 0 {
+			return blocks
+		}
+		raw = raw[start+3:]
+
+		newline := strings.IndexByte(raw, '\n')
+		if newline < 0 {
+			return blocks
+		}
+		raw = raw[newline+1:]
+
+		end := strings.Index(raw, "```")
+		if end < 0 {
+			return blocks
+		}
+		blocks = append(blocks, strings.TrimSpace(raw[:end]))
+		raw = raw[end+3:]
+	}
+}
+
+func extractInlineJSONValues(raw string, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+
+	values := make([]string, 0, limit)
+	for i := 0; i < len(raw) && len(values) < limit; i++ {
+		switch raw[i] {
+		case '{', '[':
+			if candidate, ok := extractBalancedJSON(raw, i); ok {
+				values = append(values, candidate)
+			}
+		}
+	}
+	return values
+}
+
+func extractBalancedJSON(raw string, start int) (string, bool) {
+	if start < 0 || start >= len(raw) {
+		return "", false
+	}
+	if raw[start] != '{' && raw[start] != '[' {
+		return "", false
+	}
+
+	stack := make([]byte, 0, 8)
+	inString := false
+	escaped := false
+
+	for i := start; i < len(raw); i++ {
+		ch := raw[i]
+		if inString {
+			switch {
+			case escaped:
+				escaped = false
+			case ch == '\\':
+				escaped = true
+			case ch == '"':
+				inString = false
+			}
+			continue
+		}
+
+		switch ch {
+		case '"':
+			inString = true
+		case '{':
+			stack = append(stack, '}')
+		case '[':
+			stack = append(stack, ']')
+		case '}', ']':
+			if len(stack) == 0 || stack[len(stack)-1] != ch {
+				return "", false
+			}
+			stack = stack[:len(stack)-1]
+			if len(stack) == 0 {
+				return raw[start : i+1], true
+			}
+		}
+	}
+
+	return "", false
 }
 
 func normalizePlan(plan organizationPlan) organizationPlan {
@@ -441,6 +603,132 @@ func normalizePlan(plan organizationPlan) organizationPlan {
 	return plan
 }
 
+func localizePlanLanguage(plan organizationPlan, preferChinese bool) organizationPlan {
+	replacements := make(map[string]string)
+
+	directories := make([]string, 0, len(plan.Directories))
+	for _, dir := range plan.Directories {
+		localized, changed := localizeDefaultPath(dir, preferChinese)
+		directories = append(directories, localized)
+		if changed && localized != dir {
+			replacements[dir] = localized
+		}
+	}
+	plan.Directories = directories
+
+	moves := make([]organizationMove, 0, len(plan.Moves))
+	for _, move := range plan.Moves {
+		localizedDst, changed := localizeDefaultPath(move.Dst, preferChinese)
+		if changed && localizedDst != move.Dst {
+			replacements[move.Dst] = localizedDst
+		}
+		move.Dst = localizedDst
+		moves = append(moves, move)
+	}
+	plan.Moves = moves
+
+	if len(replacements) > 0 {
+		for i, command := range plan.Commands {
+			plan.Commands[i] = applyPathReplacements(command, replacements)
+		}
+	}
+
+	return plan
+}
+
+func localizeDefaultPath(path string, preferChinese bool) (string, bool) {
+	parts := strings.Split(path, "/")
+	changed := false
+	for i, part := range parts {
+		localized := localizeDefaultDirectoryName(part, preferChinese)
+		if localized != part {
+			parts[i] = localized
+			changed = true
+		}
+	}
+	return strings.Join(parts, "/"), changed
+}
+
+func localizeDefaultDirectoryName(name string, preferChinese bool) string {
+	key := normalizeDirectoryNameKey(name)
+	if key == "" {
+		return name
+	}
+	pair, ok := defaultDirectoryNameTranslations[key]
+	if !ok {
+		return name
+	}
+	if preferChinese {
+		return pair.zh
+	}
+	return pair.en
+}
+
+func normalizeDirectoryNameKey(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	replacer := strings.NewReplacer("_", "", "-", "", " ", "")
+	return replacer.Replace(name)
+}
+
+type localizedDirectoryPair struct {
+	zh string
+	en string
+}
+
+var defaultDirectoryNameTranslations = map[string]localizedDirectoryPair{
+	"docs":          {zh: "文档", en: "Docs"},
+	"document":      {zh: "文档", en: "Docs"},
+	"documents":     {zh: "文档", en: "Docs"},
+	"images":        {zh: "图片", en: "Images"},
+	"image":         {zh: "图片", en: "Images"},
+	"pictures":      {zh: "图片", en: "Images"},
+	"photos":        {zh: "图片", en: "Images"},
+	"videos":        {zh: "视频", en: "Videos"},
+	"video":         {zh: "视频", en: "Videos"},
+	"audio":         {zh: "音频", en: "Audio"},
+	"music":         {zh: "音频", en: "Audio"},
+	"archives":      {zh: "压缩包", en: "Archives"},
+	"archive":       {zh: "压缩包", en: "Archives"},
+	"compressed":    {zh: "压缩包", en: "Archives"},
+	"code":          {zh: "代码", en: "Code"},
+	"source":        {zh: "代码", en: "Code"},
+	"others":        {zh: "其他", en: "Others"},
+	"other":         {zh: "其他", en: "Others"},
+	"misc":          {zh: "其他", en: "Others"},
+	"miscellaneous": {zh: "其他", en: "Others"},
+	"text":          {zh: "文本", en: "Text"},
+	"texts":         {zh: "文本", en: "Text"},
+	"spreadsheets":  {zh: "表格", en: "Spreadsheets"},
+	"presentation":  {zh: "演示文稿", en: "Presentations"},
+	"presentations": {zh: "演示文稿", en: "Presentations"},
+	"byextension":   {zh: "按扩展名", en: "by_extension"},
+	"bytype":        {zh: "按类型", en: "by_type"},
+}
+
+func applyPathReplacements(text string, replacements map[string]string) string {
+	if len(replacements) == 0 || strings.TrimSpace(text) == "" {
+		return text
+	}
+	type replacement struct {
+		old string
+		new string
+	}
+	items := make([]replacement, 0, len(replacements))
+	for oldValue, newValue := range replacements {
+		if oldValue == "" || oldValue == newValue {
+			continue
+		}
+		items = append(items, replacement{old: oldValue, new: newValue})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return len(items[i].old) > len(items[j].old)
+	})
+	for _, item := range items {
+		text = strings.ReplaceAll(text, item.old, item.new)
+	}
+	return text
+}
+
 type bashCommandResult struct {
 	Command  string `json:"command"`
 	Workdir  string `json:"workdir"`
@@ -502,6 +790,21 @@ func validatePlanningToolCall(ctx tool.Context, calledTool tool.Tool, args map[s
 		return nil, nil
 	}
 	toolName := calledTool.Name()
+	current := getStateInt(ctx.State(), stateKeyPlanningToolCalls)
+	if current == 0 && intentUsesExtensionGrouping(getStateString(ctx.State(), stateKeyOrganizationIntent)) {
+		switch toolName {
+		case "list_files", "find_files", "glob_files", "grep_text", "read_file":
+			return nil, fmt.Errorf("%s is too specific for the first inspection step in extension-based grouping; start with an extension summary instead", toolName)
+		case "bash":
+			command := strings.TrimSpace(stringArg(args, "command"))
+			if command == "" {
+				return nil, fmt.Errorf("planning bash command is required")
+			}
+			if !isExtensionSummaryCommand(command) {
+				return nil, fmt.Errorf("for extension-based grouping, the first bash inspection must summarize extensions without listing full filenames")
+			}
+		}
+	}
 	switch toolName {
 	case "write_todo", "read_todo":
 		return nil, nil
@@ -511,7 +814,7 @@ func validatePlanningToolCall(ctx tool.Context, calledTool tool.Tool, args map[s
 	if !isPlanningInspectionTool(toolName) {
 		return nil, nil
 	}
-	if current := getStateInt(ctx.State(), stateKeyPlanningToolCalls); current >= maxPlanningInspectionToolCalls {
+	if current >= maxPlanningInspectionToolCalls {
 		return nil, fmt.Errorf("planning inspection budget exhausted; return the final JSON plan using the observations already collected")
 	}
 	if toolName == "bash" {
@@ -524,6 +827,40 @@ func validatePlanningToolCall(ctx tool.Context, calledTool tool.Tool, args map[s
 		}
 	}
 	return nil, nil
+}
+
+func intentUsesExtensionGrouping(intent string) bool {
+	intent = strings.ToLower(strings.TrimSpace(intent))
+	if intent == "" {
+		return false
+	}
+	keywords := []string{
+		"extension",
+		"extensions",
+		"ext",
+		"suffix",
+		"file type",
+		"file types",
+		"扩展名",
+		"后缀",
+		"文件类型",
+	}
+	for _, keyword := range keywords {
+		if strings.Contains(intent, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+func isExtensionSummaryCommand(command string) bool {
+	normalized := strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(command)), " "))
+	if normalized == "" {
+		return false
+	}
+	return strings.Contains(normalized, "find . -type f") &&
+		strings.Contains(normalized, "awk") &&
+		(strings.Contains(normalized, "uniq") || strings.Contains(normalized, "[no extension]"))
 }
 
 func validateDiscoveryCommand(command string) error {
@@ -841,28 +1178,44 @@ func dedupeStrings(items []string) []string {
 	return out
 }
 
-func formatPlanForConfirmation(plan organizationPlan, review planReview) string {
+func formatPlanForConfirmation(plan organizationPlan, review planReview, preferChinese bool) string {
 	var builder strings.Builder
-	builder.WriteString("Plan ready. Review the proposed execution below and reply with yes to execute, no to cancel, or send a revised rule to regenerate the plan.\n\n")
+	if preferChinese {
+		builder.WriteString("计划已经生成。请先检查下面的执行方案；回复“确认”开始执行，回复“取消”停止，或者直接发送新的整理规则让我重新生成计划。\n\n")
+	} else {
+		builder.WriteString("Plan ready. Review the proposed execution below and reply with yes to execute, no to cancel, or send a revised rule to regenerate the plan.\n\n")
+	}
 	if plan.Summary != "" {
 		builder.WriteString(plan.Summary)
 		builder.WriteString("\n\n")
 	}
 	if len(plan.Commands) > 0 {
-		builder.WriteString(fmt.Sprintf("Planned shell commands: %d\n", len(plan.Commands)))
+		if preferChinese {
+			builder.WriteString(fmt.Sprintf("计划执行的 Shell 命令：%d\n", len(plan.Commands)))
+		} else {
+			builder.WriteString(fmt.Sprintf("Planned shell commands: %d\n", len(plan.Commands)))
+		}
 		for _, note := range plan.Notes {
 			builder.WriteString("- ")
 			builder.WriteString(note)
 			builder.WriteString("\n")
 		}
-		builder.WriteString("\nCommands:\n")
+		if preferChinese {
+			builder.WriteString("\n命令列表：\n")
+		} else {
+			builder.WriteString("\nCommands:\n")
+		}
 		for _, command := range plan.Commands {
 			builder.WriteString("- ")
 			builder.WriteString(command)
 			builder.WriteString("\n")
 		}
 	} else {
-		builder.WriteString(fmt.Sprintf("Planned moves: %d\n", len(plan.Moves)))
+		if preferChinese {
+			builder.WriteString(fmt.Sprintf("计划移动文件：%d\n", len(plan.Moves)))
+		} else {
+			builder.WriteString(fmt.Sprintf("Planned moves: %d\n", len(plan.Moves)))
+		}
 		for _, move := range plan.Moves {
 			builder.WriteString("- ")
 			builder.WriteString(move.Src)
@@ -877,37 +1230,94 @@ func formatPlanForConfirmation(plan organizationPlan, review planReview) string 
 		}
 	}
 	if len(review.Warnings) > 0 {
-		builder.WriteString("\nWarnings:\n")
+		if preferChinese {
+			builder.WriteString("\n注意事项：\n")
+		} else {
+			builder.WriteString("\nWarnings:\n")
+		}
 		for _, warning := range review.Warnings {
 			builder.WriteString("- ")
-			builder.WriteString(warning)
+			builder.WriteString(localizePlanFinding(warning, preferChinese))
 			builder.WriteString("\n")
 		}
 	}
 	return strings.TrimSpace(builder.String())
 }
 
-func formatPlanIssues(review planReview) string {
+func formatPlanIssues(review planReview, preferChinese bool) string {
 	var builder strings.Builder
-	builder.WriteString("The plan was not approved. Update the organization rule and I will regenerate it.\n")
+	if preferChinese {
+		builder.WriteString("当前计划未通过校验。请调整整理规则，我会重新生成。\n")
+	} else {
+		builder.WriteString("The plan was not approved. Update the organization rule and I will regenerate it.\n")
+	}
 	for _, issue := range review.Issues {
 		builder.WriteString("- ")
-		builder.WriteString(issue)
+		builder.WriteString(localizePlanFinding(issue, preferChinese))
 		builder.WriteString("\n")
 	}
 	if len(review.Warnings) > 0 {
-		builder.WriteString("\nWarnings:\n")
+		if preferChinese {
+			builder.WriteString("\n注意事项：\n")
+		} else {
+			builder.WriteString("\nWarnings:\n")
+		}
 		for _, warning := range review.Warnings {
 			builder.WriteString("- ")
-			builder.WriteString(warning)
+			builder.WriteString(localizePlanFinding(warning, preferChinese))
 			builder.WriteString("\n")
 		}
 	}
 	return strings.TrimSpace(builder.String())
 }
 
-func initializePlanTodos(state session.State, plan organizationPlan) (todotool.WriteTodoResult, error) {
-	todos := make([]todotool.TodoItem, 0, len(plan.Directories)+len(plan.Moves)+len(plan.Commands))
+func localizePlanFinding(finding string, preferChinese bool) string {
+	if !preferChinese {
+		return finding
+	}
+	switch {
+	case finding == "shell command is empty":
+		return "Shell 命令为空"
+	case strings.HasPrefix(finding, "unsafe shell command in plan: "):
+		return "计划里包含不安全的 Shell 命令：" + strings.TrimPrefix(finding, "unsafe shell command in plan: ")
+	case strings.HasPrefix(finding, "source file not found in inventory: "):
+		return "在目录清单中找不到源文件：" + strings.TrimPrefix(finding, "source file not found in inventory: ")
+	case strings.HasPrefix(finding, "destination path is empty for "):
+		return "目标路径为空：" + strings.TrimPrefix(finding, "destination path is empty for ")
+	case strings.HasPrefix(finding, "destination path is invalid: "):
+		return "目标路径不合法：" + strings.TrimPrefix(finding, "destination path is invalid: ")
+	case strings.HasPrefix(finding, "renaming is not allowed: "):
+		return "当前规则不允许重命名：" + strings.TrimPrefix(finding, "renaming is not allowed: ")
+	case strings.HasPrefix(finding, "duplicate source file in plan: "):
+		return "计划里重复引用了源文件：" + strings.TrimPrefix(finding, "duplicate source file in plan: ")
+	case strings.HasPrefix(finding, "multiple files target the same destination: "):
+		return "多个文件指向同一个目标路径：" + strings.TrimPrefix(finding, "multiple files target the same destination: ")
+	default:
+		return finding
+	}
+}
+
+func clearTodoState(state session.State) (todotool.WriteTodoResult, error) {
+	return todotool.ClearTodos(state)
+}
+
+// findTodoIndex returns the index of the first todo item whose Content equals content, or -1 if not found.
+func findTodoIndex(todos []todotool.TodoItem, content string) int {
+	for i, t := range todos {
+		if t.Content == content {
+			return i
+		}
+	}
+	return -1
+}
+
+// initializeFullPhaseTodos creates the authoritative todo list for the whole workflow:
+// Scan (completed), Confirm (in_progress), each execution step (pending), Verify (pending).
+func initializeFullPhaseTodos(state session.State, plan organizationPlan) (todotool.WriteTodoResult, error) {
+	todos := []todotool.TodoItem{
+		{Content: todoContentScan, Status: "completed", ActiveForm: "Scanning directory"},
+		{Content: todoContentConfirm, Status: "in_progress", ActiveForm: "Waiting for confirmation"},
+	}
 	for _, dir := range plan.Directories {
 		todos = append(todos, todotool.TodoItem{
 			Content:    "Create directory: " + dir,
@@ -929,11 +1339,28 @@ func initializePlanTodos(state session.State, plan organizationPlan) (todotool.W
 			ActiveForm: fmt.Sprintf("Running shell command %d", i+1),
 		})
 	}
+	todos = append(todos, todotool.TodoItem{
+		Content:    todoContentVerify,
+		Status:     "pending",
+		ActiveForm: "Verifying no files were missed",
+	})
 	return todotool.ReplaceTodos(state, todos)
 }
 
-func clearTodoState(state session.State) (todotool.WriteTodoResult, error) {
-	return todotool.ClearTodos(state)
+// verifyExecutionCompleteness scans root for files that are still directly inside root (not in any subdirectory).
+// Any such files were not moved into a category folder and may have been missed by the plan.
+func verifyExecutionCompleteness(root string) ([]string, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, fmt.Errorf("scan root after execution: %w", err)
+	}
+	var files []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			files = append(files, entry.Name())
+		}
+	}
+	return files, nil
 }
 
 func executeOrganizationPlan(invocationID string, state session.State, root string, plan organizationPlan, moveTools []tool.Tool, bashTool tool.Tool) (executionResult, []*session.Event, error) {
@@ -945,43 +1372,74 @@ func executeOrganizationPlan(invocationID string, state session.State, root stri
 	moveTool, createDirTool := lookupMoveTools(moveTools)
 	result := executionResult{}
 	steps := buildExecutionSteps(root, plan, moveTool, createDirTool, bashTool)
-	todos := buildExecutionTodos(steps)
-	todoEvents := make([]*session.Event, 0, 1+len(steps)*2)
+	todoEvents := make([]*session.Event, 0, 2+len(steps)*2+4)
 
-	initialTodo, err := todotool.ReplaceTodos(state, todos)
-	if err != nil {
-		return executionResult{}, nil, fmt.Errorf("initialize todo list: %w", err)
+	// Load existing full-phase todos (set by initializeFullPhaseTodos before confirmation).
+	todos, loadErr := todotool.LoadTodos(state)
+	useFullPhase := loadErr == nil && len(todos) >= 2 && todos[0].Content == todoContentScan
+
+	if !useFullPhase {
+		// Legacy fallback when called outside the normal workflow (e.g., tests).
+		todos = buildExecutionTodos(steps)
+		initial, err := todotool.ReplaceTodos(state, todos)
+		if err != nil {
+			return executionResult{}, nil, fmt.Errorf("initialize todo list: %w", err)
+		}
+		todoEvents = append(todoEvents, todoResultEvent(invocationID, initial))
 	}
-	todoEvents = append(todoEvents, todoResultEvent(invocationID, initialTodo))
+
+	// Mark "Awaiting your confirmation" as completed now that the user has confirmed.
+	confirmIdx := findTodoIndex(todos, todoContentConfirm)
+	if confirmIdx >= 0 {
+		todos[confirmIdx].Status = "completed"
+		updated, err := todotool.ReplaceTodos(state, todos)
+		if err != nil {
+			return result, todoEvents, fmt.Errorf("mark confirm completed: %w", err)
+		}
+		todoEvents = append(todoEvents, todoResultEvent(invocationID, updated))
+	}
 
 	if len(steps) == 0 {
-		if err := todotool.EnsureAllCompleted(state); err != nil {
-			return executionResult{}, todoEvents, err
+		verifyIdx := findTodoIndex(todos, todoContentVerify)
+		if verifyIdx >= 0 {
+			todos[verifyIdx].Status = "in_progress"
+			if u, err := todotool.ReplaceTodos(state, todos); err == nil {
+				todoEvents = append(todoEvents, todoResultEvent(invocationID, u))
+			}
+			todos[verifyIdx].Status = "completed"
+			if u, err := todotool.ReplaceTodos(state, todos); err == nil {
+				todoEvents = append(todoEvents, todoResultEvent(invocationID, u))
+			}
 		}
-		result.TodoList = initialTodo.TodoList
+		_ = todotool.EnsureAllCompleted(state)
 		return result, todoEvents, nil
 	}
 
-	for i, step := range steps {
-		inProgress, err := setTodoStatus(state, todos, i, "in_progress")
-		if err != nil {
-			return result, todoEvents, fmt.Errorf("set todo in_progress for step %d: %w", i+1, err)
+	// Execute each step, updating its todo item from pending → in_progress → completed.
+	for _, step := range steps {
+		idx := findTodoIndex(todos, step.Label)
+		if idx >= 0 {
+			todos[idx].Status = "in_progress"
+			updated, err := todotool.ReplaceTodos(state, todos)
+			if err != nil {
+				return result, todoEvents, fmt.Errorf("set in_progress for %q: %w", step.Label, err)
+			}
+			todoEvents = append(todoEvents, todoResultEvent(invocationID, updated))
 		}
-		todos = inProgress.Todos
-		todoEvents = append(todoEvents, todoResultEvent(invocationID, inProgress))
 
 		if err := step.Run(); err != nil {
 			result.Failures = append(result.Failures, fmt.Sprintf("%s: %v", step.Label, err))
-			result.TodoList = inProgress.TodoList
-			return result, todoEvents, fmt.Errorf("step %d failed: %w", i+1, err)
+			return result, todoEvents, fmt.Errorf("step %q failed: %w", step.Label, err)
 		}
 
-		completed, err := setTodoStatus(state, todos, i, "completed")
-		if err != nil {
-			return result, todoEvents, fmt.Errorf("set todo completed for step %d: %w", i+1, err)
+		if idx >= 0 {
+			todos[idx].Status = "completed"
+			updated, err := todotool.ReplaceTodos(state, todos)
+			if err != nil {
+				return result, todoEvents, fmt.Errorf("set completed for %q: %w", step.Label, err)
+			}
+			todoEvents = append(todoEvents, todoResultEvent(invocationID, updated))
 		}
-		todos = completed.Todos
-		todoEvents = append(todoEvents, todoResultEvent(invocationID, completed))
 
 		switch {
 		case strings.HasPrefix(step.Label, "Create directory: "):
@@ -994,6 +1452,27 @@ func executeOrganizationPlan(invocationID string, state session.State, root stri
 			}
 		case strings.HasPrefix(step.Label, "Run shell command "):
 			result.Commands = append(result.Commands, step.ActiveForm)
+		}
+	}
+
+	// Verify completeness: scan root for any files that remain at the top level.
+	// Only meaningful for move-based plans (command-based plans use shell, harder to verify).
+	verifyIdx := findTodoIndex(todos, todoContentVerify)
+	if verifyIdx >= 0 {
+		todos[verifyIdx].Status = "in_progress"
+		if updated, err := todotool.ReplaceTodos(state, todos); err == nil {
+			todoEvents = append(todoEvents, todoResultEvent(invocationID, updated))
+		}
+
+		if len(plan.Commands) == 0 {
+			if unmoved, err := verifyExecutionCompleteness(root); err == nil {
+				result.UnmovedFiles = unmoved
+			}
+		}
+
+		todos[verifyIdx].Status = "completed"
+		if updated, err := todotool.ReplaceTodos(state, todos); err == nil {
+			todoEvents = append(todoEvents, todoResultEvent(invocationID, updated))
 		}
 	}
 
@@ -1059,24 +1538,6 @@ func buildExecutionTodos(steps []executionStep) []todotool.TodoItem {
 		})
 	}
 	return todos
-}
-
-func setTodoStatus(state session.State, todos []todotool.TodoItem, activeIndex int, status string) (todotool.WriteTodoResult, error) {
-	next := make([]todotool.TodoItem, len(todos))
-	copy(next, todos)
-	for i := range next {
-		switch {
-		case i < activeIndex && next[i].Status != "completed":
-			next[i].Status = "completed"
-		case i == activeIndex:
-			next[i].Status = status
-		case i > activeIndex && next[i].Status == "completed":
-			next[i].Status = "pending"
-		case i > activeIndex:
-			next[i].Status = "pending"
-		}
-	}
-	return todotool.ReplaceTodos(state, next)
 }
 
 func todoResultEvent(invocationID string, result todotool.WriteTodoResult) *session.Event {
@@ -1166,28 +1627,68 @@ func movePathWithTool(src, dst string, moveTool tool.Tool) error {
 	return err
 }
 
-func formatExecutionResult(result executionResult) string {
+func formatExecutionStopped(err error, preferChinese bool) string {
+	if preferChinese {
+		return fmt.Sprintf("执行已停止：%v", err)
+	}
+	return fmt.Sprintf("Execution stopped: %v", err)
+}
+
+func formatExecutionResult(result executionResult, preferChinese bool) string {
 	var builder strings.Builder
 	switch {
 	case len(result.Commands) > 0:
-		builder.WriteString(fmt.Sprintf("Execution complete. Ran %d shell command(s).", len(result.Commands)))
+		if preferChinese {
+			builder.WriteString(fmt.Sprintf("执行完成，共运行 %d 条 Shell 命令。", len(result.Commands)))
+		} else {
+			builder.WriteString(fmt.Sprintf("Execution complete. Ran %d shell command(s).", len(result.Commands)))
+		}
 	case len(result.Moved) > 0:
-		builder.WriteString(fmt.Sprintf("Execution complete. Moved %d file(s).", len(result.Moved)))
+		if preferChinese {
+			builder.WriteString(fmt.Sprintf("执行完成，共移动 %d 个文件。", len(result.Moved)))
+		} else {
+			builder.WriteString(fmt.Sprintf("Execution complete. Moved %d file(s).", len(result.Moved)))
+		}
 	default:
-		builder.WriteString("Execution complete.")
+		if preferChinese {
+			builder.WriteString("执行完成。")
+		} else {
+			builder.WriteString("Execution complete.")
+		}
 	}
 	if len(result.CreatedDir) > 0 {
-		builder.WriteString(fmt.Sprintf(" Created %d directorie(s).", len(result.CreatedDir)))
+		if preferChinese {
+			builder.WriteString(fmt.Sprintf(" 已创建 %d 个目录。", len(result.CreatedDir)))
+		} else {
+			builder.WriteString(fmt.Sprintf(" Created %d director(ies).", len(result.CreatedDir)))
+		}
 	}
-	if len(result.Failures) == 0 {
-		return builder.String()
+	if len(result.UnmovedFiles) > 0 {
+		if preferChinese {
+			builder.WriteString(fmt.Sprintf("\n\n校验结果：根目录下还有 %d 个文件未被整理，可能是遗漏项：%s",
+				len(result.UnmovedFiles), strings.Join(result.UnmovedFiles, "、")))
+		} else {
+			builder.WriteString(fmt.Sprintf("\n\nVerification: %d file(s) remain at root level and may have been missed: %s",
+				len(result.UnmovedFiles), strings.Join(result.UnmovedFiles, ", ")))
+		}
+	} else if len(result.Commands) == 0 && len(result.Failures) == 0 {
+		if preferChinese {
+			builder.WriteString("\n\n校验结果：所有文件都已整理完成。")
+		} else {
+			builder.WriteString("\n\nVerification: all files organized.")
+		}
 	}
-
-	builder.WriteString("\n\nFailures:\n")
-	for _, failure := range result.Failures {
-		builder.WriteString("- ")
-		builder.WriteString(failure)
-		builder.WriteString("\n")
+	if len(result.Failures) > 0 {
+		if preferChinese {
+			builder.WriteString("\n\n失败项：\n")
+		} else {
+			builder.WriteString("\n\nFailures:\n")
+		}
+		for _, failure := range result.Failures {
+			builder.WriteString("- ")
+			builder.WriteString(failure)
+			builder.WriteString("\n")
+		}
 	}
 	return strings.TrimSpace(builder.String())
 }

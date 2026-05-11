@@ -1,11 +1,13 @@
 package main
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
 	"iter"
+	"os"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"google.golang.org/adk/agent"
 	"google.golang.org/adk/model"
@@ -22,9 +24,12 @@ const (
 	stateKeyOrganizePending      = "organize_pending"
 	stateKeyPendingField         = "organize_pending_field"
 	stateKeyAwaitingConfirmation = "awaiting_confirmation"
+	stateKeyResponseLanguage     = "response_language"
 )
 
 var pathPattern = regexp.MustCompile(`(?i)(~?[/\\][^\s"'，。；;]+|[A-Za-z]:\\[^\s"'，。；;]+|/(Users|tmp|var|etc|home|opt|private|Volumes)/[^\s"'，。；;]+)`)
+var hanPattern = regexp.MustCompile(`\p{Han}`)
+var latinLetterPattern = regexp.MustCompile(`[A-Za-z]`)
 
 type intakeAnalysis struct {
 	Relevant            bool   `json:"relevant"`
@@ -56,6 +61,7 @@ func newRootAgent(model model.LLM, repoRoot string, fileTools []tool.Tool, bashT
 		Run: func(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
 			return func(yield func(*session.Event, error) bool) {
 				userText := strings.TrimSpace(contentPlainText(ctx.UserContent()))
+				updateResponseLanguageFromInput(ctx.Session().State(), userText)
 				if strings.EqualFold(getStateString(ctx.Session().State(), stateKeyAwaitingConfirmation), "true") {
 					switch {
 					case isExecutionConfirmed(userText):
@@ -74,7 +80,7 @@ func newRootAgent(model model.LLM, repoRoot string, fileTools []tool.Tool, bashT
 								return
 							}
 						}
-						yield(stateTextEvent(ctx.InvocationID(), "Operation cancelled. / 已取消本次整理。", clearedWorkflowStateDelta()), nil)
+						yield(stateTextEvent(ctx.InvocationID(), localizeText(ctx.Session().State(), "已取消本次整理。", "Operation cancelled."), clearedWorkflowStateDelta()), nil)
 						return
 					case userText != "":
 						yield(stateOnlyEvent(ctx.InvocationID(), map[string]any{
@@ -104,6 +110,16 @@ func newRootAgent(model model.LLM, repoRoot string, fileTools []tool.Tool, bashT
 				}
 
 				if !hasConcreteTaskDefinition(ctx.Session().State()) {
+					return
+				}
+
+				targetPath := getStateString(ctx.Session().State(), stateKeyTargetPath)
+				if _, _, err := resolveOrganizationPath(repoRoot, targetPath); err != nil {
+					yield(stateTextEvent(ctx.InvocationID(), formatTargetPathValidationError(targetPath, err, prefersChinese(ctx.Session().State())), map[string]any{
+						stateKeyAwaitingConfirmation: "",
+						stateKeyOrganizePending:      "true",
+						stateKeyPendingField:         "path",
+					}), nil)
 					return
 				}
 
@@ -147,7 +163,7 @@ func newRootAgent(model model.LLM, repoRoot string, fileTools []tool.Tool, bashT
 								return
 							}
 						}
-						yield(stateTextEvent(ctx.InvocationID(), "No files found in the target directory. / 目标目录里没有可整理的文件。", clearedWorkflowStateDelta()), nil)
+						yield(stateTextEvent(ctx.InvocationID(), localizeText(ctx.Session().State(), "目标目录里没有可整理的文件。", "No files found in the target directory."), clearedWorkflowStateDelta()), nil)
 						return
 					}
 					review = mergeReviewWithValidation(review, validateOrganizationPlan(plan, inventory))
@@ -159,7 +175,7 @@ func newRootAgent(model model.LLM, repoRoot string, fileTools []tool.Tool, bashT
 							return
 						}
 					}
-					yield(stateTextEvent(ctx.InvocationID(), formatPlanIssues(review), map[string]any{
+					yield(stateTextEvent(ctx.InvocationID(), formatPlanIssues(review, prefersChinese(ctx.Session().State())), map[string]any{
 						stateKeyAwaitingConfirmation: "",
 					}), nil)
 					return
@@ -171,11 +187,11 @@ func newRootAgent(model model.LLM, repoRoot string, fileTools []tool.Tool, bashT
 							return
 						}
 					}
-					yield(stateTextEvent(ctx.InvocationID(), "The reviewed plan does not require any file moves. / 审核后的计划不需要移动任何文件。", clearedWorkflowStateDelta()), nil)
+					yield(stateTextEvent(ctx.InvocationID(), localizeText(ctx.Session().State(), "审核后的计划不需要移动任何文件。", "The reviewed plan does not require any file moves."), clearedWorkflowStateDelta()), nil)
 					return
 				}
 
-				todoResult, err := initializePlanTodos(ctx.Session().State(), plan)
+				todoResult, err := initializeFullPhaseTodos(ctx.Session().State(), plan)
 				if err != nil {
 					yield(nil, err)
 					return
@@ -184,7 +200,7 @@ func newRootAgent(model model.LLM, repoRoot string, fileTools []tool.Tool, bashT
 					return
 				}
 
-				yield(stateTextEvent(ctx.InvocationID(), formatPlanForConfirmation(plan, review), map[string]any{
+				yield(stateTextEvent(ctx.InvocationID(), formatPlanForConfirmation(plan, review, prefersChinese(ctx.Session().State())), map[string]any{
 					stateKeyAwaitingConfirmation: "true",
 					stateKeyOrganizePending:      "false",
 					stateKeyPendingField:         "",
@@ -303,6 +319,73 @@ func getStateString(state session.State, key string) string {
 	return strings.TrimSpace(s)
 }
 
+func updateResponseLanguageFromInput(state session.State, text string) {
+	if state == nil {
+		return
+	}
+	lang := detectResponseLanguage(getStateString(state, stateKeyResponseLanguage), text)
+	if lang == "" {
+		return
+	}
+	_ = state.Set(stateKeyResponseLanguage, lang)
+}
+
+func detectResponseLanguage(current, text string) string {
+	text = strings.TrimSpace(text)
+	current = strings.TrimSpace(current)
+	if text == "" {
+		if current != "" {
+			return current
+		}
+		return "en"
+	}
+	if hanPattern.MatchString(text) {
+		return "zh"
+	}
+	if current != "" && utf8.RuneCountInString(text) <= 12 {
+		return current
+	}
+	if latinLetterPattern.MatchString(text) {
+		return "en"
+	}
+	if current != "" {
+		return current
+	}
+	return "en"
+}
+
+func prefersChinese(state session.State) bool {
+	return getStateString(state, stateKeyResponseLanguage) == "zh"
+}
+
+func localizeText(state session.State, zh, en string) string {
+	if prefersChinese(state) {
+		return zh
+	}
+	return en
+}
+
+func formatTargetPathValidationError(path string, err error, preferChinese bool) string {
+	path = strings.TrimSpace(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		if preferChinese {
+			return fmt.Sprintf("目标目录不存在：%s\n请确认目录路径后再发我一次。", path)
+		}
+		return fmt.Sprintf("The target directory does not exist: %s\nPlease confirm the directory path and send it again.", path)
+	case strings.Contains(strings.ToLower(err.Error()), "not a directory"):
+		if preferChinese {
+			return fmt.Sprintf("目标路径不是目录：%s\n请提供一个可访问的目录路径。", path)
+		}
+		return fmt.Sprintf("The target path is not a directory: %s\nPlease provide an accessible directory path.", path)
+	default:
+		if preferChinese {
+			return fmt.Sprintf("无法访问目标目录：%s\n错误信息：%v\n请确认路径是否正确，或检查挂载和权限后再试。", path, err)
+		}
+		return fmt.Sprintf("Unable to access the target directory: %s\nError: %v\nPlease confirm the path or check mounts and permissions, then try again.", path, err)
+	}
+}
+
 func extractTargetPath(text string) string {
 	matches := pathPattern.FindStringSubmatch(text)
 	if len(matches) > 0 {
@@ -368,18 +451,8 @@ Guidelines:
 }
 
 func parseIntakeAnalysis(text string) (intakeAnalysis, bool) {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return intakeAnalysis{}, false
-	}
-
-	text = strings.TrimPrefix(text, "```json")
-	text = strings.TrimPrefix(text, "```")
-	text = strings.TrimSuffix(text, "```")
-	text = strings.TrimSpace(text)
-
-	var analysis intakeAnalysis
-	if err := json.Unmarshal([]byte(text), &analysis); err != nil {
+	analysis, err := parseJSONBlock[intakeAnalysis](text)
+	if err != nil {
 		return intakeAnalysis{}, false
 	}
 	analysis.Path = strings.TrimSpace(analysis.Path)
@@ -413,7 +486,7 @@ func fallbackIntakeAnalysis(text, pendingField string) intakeAnalysis {
 
 func generateIntakeQuestion(ctx agent.InvocationContext, intakeModel model.LLM, userText, path, intent, missingField string) string {
 	if intakeModel == nil {
-		return intakeQuestionFallback(missingField)
+		return intakeQuestionFallback(missingField, prefersChinese(ctx.Session().State()))
 	}
 
 	systemPrompt := `You are the intake stage of a file-organization assistant.
@@ -455,14 +528,20 @@ Rules:
 		}
 	}
 
-	return intakeQuestionFallback(missingField)
+	return intakeQuestionFallback(missingField, prefersChinese(ctx.Session().State()))
 }
 
-func intakeQuestionFallback(missingField string) string {
+func intakeQuestionFallback(missingField string, preferChinese bool) string {
 	if missingField == "intent" {
-		return "How would you like the files organized? / 请说下整理规则？"
+		if preferChinese {
+			return "你希望我按什么规则整理这些文件？"
+		}
+		return "How would you like the files organized?"
 	}
-	return "Which directory? / 请提供目录路径？"
+	if preferChinese {
+		return "请提供要整理的目录路径。"
+	}
+	return "Which directory should I organize?"
 }
 
 func hasConcreteTaskValues(path, intent string) bool {

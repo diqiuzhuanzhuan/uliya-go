@@ -81,7 +81,7 @@ func TestWorkflowSupportsMultiTurnPathIntentAndConfirmation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second turn error = %v", err)
 	}
-	if !strings.Contains(secondTurn, "Plan ready.") {
+	if !strings.Contains(secondTurn, "计划已经生成") {
 		t.Fatalf("expected confirmation plan after second turn, got %q", secondTurn)
 	}
 
@@ -96,7 +96,7 @@ func TestWorkflowSupportsMultiTurnPathIntentAndConfirmation(t *testing.T) {
 	if got := getStateString(storedAfterSecond.Session.State(), stateKeyAwaitingConfirmation); got != "true" {
 		t.Fatalf("expected awaiting_confirmation=true after second turn, got %q", got)
 	}
-	if !strings.Contains(secondTurn, "invoice.txt -> Docs/2026-04/invoice.txt") {
+	if !strings.Contains(secondTurn, "invoice.txt -> 文档/2026-04/invoice.txt") {
 		t.Fatalf("expected planned move in second turn output, got %q", secondTurn)
 	}
 
@@ -104,10 +104,10 @@ func TestWorkflowSupportsMultiTurnPathIntentAndConfirmation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("third turn error = %v", err)
 	}
-	if !strings.Contains(thirdTurn, "Execution complete.") {
+	if !strings.Contains(thirdTurn, "执行完成") {
 		t.Fatalf("expected execution result after confirmation, got %q", thirdTurn)
 	}
-	if _, statErr := os.Stat(filepath.Join(targetDir, "Docs", "2026-04", "invoice.txt")); statErr != nil {
+	if _, statErr := os.Stat(filepath.Join(targetDir, "文档", "2026-04", "invoice.txt")); statErr != nil {
 		t.Fatalf("expected organized file to exist, stat error = %v", statErr)
 	}
 
@@ -168,7 +168,7 @@ func TestWorkflowUsesShellPlanningForExtensionIntent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second turn error = %v", err)
 	}
-	if !strings.Contains(secondTurn, "Plan ready.") {
+	if !strings.Contains(secondTurn, "计划已经生成") {
 		t.Fatalf("expected confirmation output, got %q", secondTurn)
 	}
 	if !strings.Contains(secondTurn, "find . -type f") {
@@ -189,19 +189,90 @@ func TestWorkflowUsesShellPlanningForExtensionIntent(t *testing.T) {
 	if !testModel.sawOrganizerTool("read_todo") {
 		t.Fatal("expected read_todo to be available to the organization agent")
 	}
+	if testModel.sawOrganizerTool("list_files") || testModel.sawOrganizerTool("find_files") || testModel.sawOrganizerTool("read_file") {
+		t.Fatal("did not expect filetools to be attached to the organization agent")
+	}
 
 	thirdTurn, err := collectRunText(testRunner.Run(context.Background(), consoleUserID, sessionID, genai.NewContentFromText("确认", genai.RoleUser), agent.RunConfig{}))
 	if err != nil {
 		t.Fatalf("third turn error = %v", err)
 	}
-	if !strings.Contains(thirdTurn, "Ran 2 shell command(s).") {
+	if !strings.Contains(thirdTurn, "共运行 2 条 Shell 命令") {
 		t.Fatalf("expected shell execution result, got %q", thirdTurn)
 	}
-	if _, statErr := os.Stat(filepath.Join(targetDir, "by_extension", "txt", "invoice.txt")); statErr != nil {
+	if _, statErr := os.Stat(filepath.Join(targetDir, "按扩展名", "txt", "invoice.txt")); statErr != nil {
 		t.Fatalf("expected txt file moved by shell command, stat error = %v", statErr)
 	}
-	if _, statErr := os.Stat(filepath.Join(targetDir, "by_extension", "jpg", "photo.jpg")); statErr != nil {
+	if _, statErr := os.Stat(filepath.Join(targetDir, "按扩展名", "jpg", "photo.jpg")); statErr != nil {
 		t.Fatalf("expected jpg file moved by shell command, stat error = %v", statErr)
+	}
+}
+
+func TestWorkflowRejectsInvalidTargetPathBeforePlanning(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	targetDir := filepath.Join(t.TempDir(), "missing-downloads")
+	testModel := &workflowScriptModel{
+		t:          t,
+		targetPath: targetDir,
+		intent:     "按扩展名整理",
+	}
+
+	bashTool, err := bashtool.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("bashtool.New() error = %v", err)
+	}
+
+	rootAgent, err := newRootAgent(testModel, t.TempDir(), nil, bashTool, todotool.New(), movetool.New())
+	if err != nil {
+		t.Fatalf("newRootAgent() error = %v", err)
+	}
+
+	sessionService := session.InMemoryService()
+	testRunner, err := runner.New(runner.Config{
+		AppName:           consoleAppName,
+		Agent:             rootAgent,
+		SessionService:    sessionService,
+		AutoCreateSession: true,
+	})
+	if err != nil {
+		t.Fatalf("runner.New() error = %v", err)
+	}
+
+	sessionID := "workflow-invalid-path"
+
+	firstTurn, err := collectRunText(testRunner.Run(context.Background(), consoleUserID, sessionID, genai.NewContentFromText("整理目录："+targetDir, genai.RoleUser), agent.RunConfig{}))
+	if err != nil {
+		t.Fatalf("first turn error = %v", err)
+	}
+	if !strings.Contains(firstTurn, "整理规则") {
+		t.Fatalf("expected intent follow-up question, got %q", firstTurn)
+	}
+
+	secondTurn, err := collectRunText(testRunner.Run(context.Background(), consoleUserID, sessionID, genai.NewContentFromText(testModel.intent, genai.RoleUser), agent.RunConfig{}))
+	if err != nil {
+		t.Fatalf("second turn error = %v", err)
+	}
+	if !strings.Contains(secondTurn, "目标目录不存在") {
+		t.Fatalf("expected invalid-path error, got %q", secondTurn)
+	}
+	if strings.Contains(secondTurn, "计划已经生成") {
+		t.Fatalf("did not expect confirmation plan for invalid path, got %q", secondTurn)
+	}
+	if testModel.sawOrganizerSystemPrompt() {
+		t.Fatal("did not expect organization planner to run for an invalid target path")
+	}
+
+	stored, err := sessionService.Get(context.Background(), &session.GetRequest{
+		AppName:   consoleAppName,
+		UserID:    consoleUserID,
+		SessionID: sessionID,
+	})
+	if err != nil {
+		t.Fatalf("session.Get() error = %v", err)
+	}
+	if got := getStateString(stored.Session.State(), stateKeyPendingField); got != "path" {
+		t.Fatalf("expected pending path after invalid path error, got %q", got)
 	}
 }
 

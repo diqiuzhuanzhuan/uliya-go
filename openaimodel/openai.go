@@ -127,10 +127,22 @@ func (m *Model) generate(ctx context.Context, req *adkmodel.LLMRequest) (*adkmod
 	}
 
 	return &adkmodel.LLMResponse{
-		Content:      content,
-		ModelVersion: chatResp.Model,
-		FinishReason: genai.FinishReason(finishReason),
+		Content:       content,
+		UsageMetadata: buildUsageMetadata(chatResp.Usage),
+		ModelVersion:  chatResp.Model,
+		FinishReason:  genai.FinishReason(finishReason),
 	}, nil
+}
+
+func buildUsageMetadata(usage openAIUsage) *genai.GenerateContentResponseUsageMetadata {
+	if usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.TotalTokens == 0 {
+		return nil
+	}
+	return &genai.GenerateContentResponseUsageMetadata{
+		PromptTokenCount:     int32(usage.PromptTokens),
+		CandidatesTokenCount: int32(usage.CompletionTokens),
+		TotalTokenCount:      int32(usage.TotalTokens),
+	}
 }
 
 func logModelRequest(ctx context.Context, req openAIChatRequest) {
@@ -567,9 +579,16 @@ type openAIToolCallFunction struct {
 }
 
 type openAIChatResponse struct {
-	Model   string `json:"model"`
+	Model   string      `json:"model"`
+	Usage   openAIUsage `json:"usage"`
 	Choices []struct {
 		Message      openAIMessage `json:"message"`
 		FinishReason string        `json:"finish_reason"`
 	} `json:"choices"`
+}
+
+type openAIUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }

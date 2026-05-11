@@ -154,7 +154,7 @@ func TestGenerateContentRetriesServerErrors(t *testing.T) {
 			_, _ = w.Write([]byte(`{"error":{"message":"temporary"}}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"model":"test-model","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+		_, _ = w.Write([]byte(`{"model":"test-model","usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18},"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
 	}))
 	defer server.Close()
 
@@ -186,6 +186,9 @@ func TestGenerateContentRetriesServerErrors(t *testing.T) {
 	}
 	if got == nil || got.Content == nil || len(got.Content.Parts) == 0 || got.Content.Parts[0].Text != "ok" {
 		t.Fatalf("unexpected response: %#v", got)
+	}
+	if got.UsageMetadata == nil || got.UsageMetadata.PromptTokenCount != 11 || got.UsageMetadata.CandidatesTokenCount != 7 || got.UsageMetadata.TotalTokenCount != 18 {
+		t.Fatalf("unexpected usage metadata: %#v", got.UsageMetadata)
 	}
 }
 
