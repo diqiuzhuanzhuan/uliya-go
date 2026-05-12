@@ -80,13 +80,13 @@ func newRootAgent(model model.LLM, repoRoot string, fileTools []tool.Tool, bashT
 								return
 							}
 						}
-						yield(stateTextEvent(ctx.InvocationID(), localizeText(ctx.Session().State(), "已取消本次整理。", "Operation cancelled."), clearedWorkflowStateDelta()), nil)
+						yield(stateTextEvent(ctx.InvocationID(), localizeText(ctx.Session().State(), "已取消本次整理。", "Operation cancelled."), withResponseLanguage(ctx.Session().State(), clearedWorkflowStateDelta())), nil)
 						return
 					case userText != "":
-						yield(stateOnlyEvent(ctx.InvocationID(), map[string]any{
+						yield(stateOnlyEvent(ctx.InvocationID(), withResponseLanguage(ctx.Session().State(), map[string]any{
 							stateKeyAwaitingConfirmation: "",
 							stateKeyOrganizationIntent:   userText,
-						}), nil)
+						})), nil)
 					default:
 						return
 					}
@@ -115,11 +115,11 @@ func newRootAgent(model model.LLM, repoRoot string, fileTools []tool.Tool, bashT
 
 				targetPath := getStateString(ctx.Session().State(), stateKeyTargetPath)
 				if _, _, err := resolveOrganizationPath(repoRoot, targetPath); err != nil {
-					yield(stateTextEvent(ctx.InvocationID(), formatTargetPathValidationError(targetPath, err, prefersChinese(ctx.Session().State())), map[string]any{
+					yield(stateTextEvent(ctx.InvocationID(), formatTargetPathValidationError(targetPath, err, prefersChinese(ctx.Session().State())), withResponseLanguage(ctx.Session().State(), map[string]any{
 						stateKeyAwaitingConfirmation: "",
 						stateKeyOrganizePending:      "true",
 						stateKeyPendingField:         "path",
-					}), nil)
+					})), nil)
 					return
 				}
 
@@ -163,7 +163,7 @@ func newRootAgent(model model.LLM, repoRoot string, fileTools []tool.Tool, bashT
 								return
 							}
 						}
-						yield(stateTextEvent(ctx.InvocationID(), localizeText(ctx.Session().State(), "目标目录里没有可整理的文件。", "No files found in the target directory."), clearedWorkflowStateDelta()), nil)
+						yield(stateTextEvent(ctx.InvocationID(), localizeText(ctx.Session().State(), "目标目录里没有可整理的文件。", "No files found in the target directory."), withResponseLanguage(ctx.Session().State(), clearedWorkflowStateDelta())), nil)
 						return
 					}
 					review = mergeReviewWithValidation(review, validateOrganizationPlan(plan, inventory))
@@ -175,9 +175,9 @@ func newRootAgent(model model.LLM, repoRoot string, fileTools []tool.Tool, bashT
 							return
 						}
 					}
-					yield(stateTextEvent(ctx.InvocationID(), formatPlanIssues(review, prefersChinese(ctx.Session().State())), map[string]any{
+					yield(stateTextEvent(ctx.InvocationID(), formatPlanIssues(review, prefersChinese(ctx.Session().State())), withResponseLanguage(ctx.Session().State(), map[string]any{
 						stateKeyAwaitingConfirmation: "",
-					}), nil)
+					})), nil)
 					return
 				}
 
@@ -187,7 +187,7 @@ func newRootAgent(model model.LLM, repoRoot string, fileTools []tool.Tool, bashT
 							return
 						}
 					}
-					yield(stateTextEvent(ctx.InvocationID(), localizeText(ctx.Session().State(), "审核后的计划不需要移动任何文件。", "The reviewed plan does not require any file moves."), clearedWorkflowStateDelta()), nil)
+					yield(stateTextEvent(ctx.InvocationID(), localizeText(ctx.Session().State(), "审核后的计划不需要移动任何文件。", "The reviewed plan does not require any file moves."), withResponseLanguage(ctx.Session().State(), clearedWorkflowStateDelta())), nil)
 					return
 				}
 
@@ -200,11 +200,11 @@ func newRootAgent(model model.LLM, repoRoot string, fileTools []tool.Tool, bashT
 					return
 				}
 
-				yield(stateTextEvent(ctx.InvocationID(), formatPlanForConfirmation(plan, review, prefersChinese(ctx.Session().State())), map[string]any{
+				yield(stateTextEvent(ctx.InvocationID(), formatPlanForConfirmation(plan, review, prefersChinese(ctx.Session().State())), withResponseLanguage(ctx.Session().State(), map[string]any{
 					stateKeyAwaitingConfirmation: "true",
 					stateKeyOrganizePending:      "false",
 					stateKeyPendingField:         "",
-				}), nil)
+				})), nil)
 				return
 			}
 		},
@@ -230,7 +230,7 @@ func newIntakeAgent(intakeModel model.LLM) (agent.Agent, error) {
 				if !analysis.Relevant && !pending {
 					if reply := generateCasualReply(ctx, intakeModel, userText); reply != "" {
 						ctx.EndInvocation()
-						yield(stateTextEvent(ctx.InvocationID(), reply, nil), nil)
+						yield(stateTextEvent(ctx.InvocationID(), reply, withResponseLanguage(ctx.Session().State(), nil)), nil)
 					}
 					return
 				}
@@ -259,11 +259,11 @@ func newIntakeAgent(intakeModel model.LLM) (agent.Agent, error) {
 					_ = ctx.Session().State().Set(stateKeyOrganizePending, "true")
 					_ = ctx.Session().State().Set(stateKeyPendingField, "path")
 					ctx.EndInvocation()
-					yield(stateTextEvent(ctx.InvocationID(), generateIntakeQuestion(ctx, intakeModel, userText, path, intent, "path"), map[string]any{
+					yield(stateTextEvent(ctx.InvocationID(), generateIntakeQuestion(ctx, intakeModel, userText, path, intent, "path"), withResponseLanguage(ctx.Session().State(), map[string]any{
 						stateKeyOrganizePending:    "true",
 						stateKeyPendingField:       "path",
 						stateKeyOrganizationIntent: intent,
-					}), nil)
+					})), nil)
 					return
 				}
 
@@ -271,21 +271,21 @@ func newIntakeAgent(intakeModel model.LLM) (agent.Agent, error) {
 					_ = ctx.Session().State().Set(stateKeyOrganizePending, "true")
 					_ = ctx.Session().State().Set(stateKeyPendingField, "intent")
 					ctx.EndInvocation()
-					yield(stateTextEvent(ctx.InvocationID(), generateIntakeQuestion(ctx, intakeModel, userText, path, intent, "intent"), map[string]any{
+					yield(stateTextEvent(ctx.InvocationID(), generateIntakeQuestion(ctx, intakeModel, userText, path, intent, "intent"), withResponseLanguage(ctx.Session().State(), map[string]any{
 						stateKeyTargetPath:      path,
 						stateKeyOrganizePending: "true",
 						stateKeyPendingField:    "intent",
-					}), nil)
+					})), nil)
 					return
 				}
 
 				_ = ctx.Session().State().Set(stateKeyOrganizePending, "false")
-				yield(stateOnlyEvent(ctx.InvocationID(), map[string]any{
+				yield(stateOnlyEvent(ctx.InvocationID(), withResponseLanguage(ctx.Session().State(), map[string]any{
 					stateKeyTargetPath:         path,
 					stateKeyOrganizationIntent: intent,
 					stateKeyOrganizePending:    "false",
 					stateKeyPendingField:       "",
-				}), nil)
+				})), nil)
 			}
 		},
 	})
@@ -302,6 +302,18 @@ func stateOnlyEvent(invocationID string, delta map[string]any) *session.Event {
 	event := session.NewEvent(invocationID)
 	event.Actions.StateDelta = delta
 	return event
+}
+
+func withResponseLanguage(state session.State, delta map[string]any) map[string]any {
+	lang := getStateString(state, stateKeyResponseLanguage)
+	if lang == "" {
+		return delta
+	}
+	if delta == nil {
+		delta = map[string]any{}
+	}
+	delta[stateKeyResponseLanguage] = lang
+	return delta
 }
 
 func getStateString(state session.State, key string) string {
@@ -342,6 +354,9 @@ func detectResponseLanguage(current, text string) string {
 	if hanPattern.MatchString(text) {
 		return "zh"
 	}
+	if current != "" && isStandalonePathReply(text) {
+		return current
+	}
 	if current != "" && utf8.RuneCountInString(text) <= 12 {
 		return current
 	}
@@ -352,6 +367,11 @@ func detectResponseLanguage(current, text string) string {
 		return current
 	}
 	return "en"
+}
+
+func isStandalonePathReply(text string) bool {
+	path := extractTargetPath(text)
+	return path != "" && strings.TrimSpace(path) == strings.TrimSpace(text)
 }
 
 func prefersChinese(state session.State) bool {
@@ -489,16 +509,25 @@ func generateIntakeQuestion(ctx agent.InvocationContext, intakeModel model.LLM, 
 		return intakeQuestionFallback(missingField, prefersChinese(ctx.Session().State()))
 	}
 
+	preferredLanguage := strings.TrimSpace(getStateString(ctx.Session().State(), stateKeyResponseLanguage))
+	if preferredLanguage == "" {
+		preferredLanguage = detectResponseLanguage("", userText)
+		if preferredLanguage == "" {
+			preferredLanguage = "en"
+		}
+	}
+
 	systemPrompt := `You are the intake stage of a file-organization assistant.
 Your job is to ask exactly one short follow-up question for the single missing piece of information.
 Rules:
-- Reply in the same language as the user's latest message.
+- Reply in the session's preferred reply language.
 - Ask only one question.
 - Be concise and natural.
 - Do not mention tools, permissions, workflows, or internal logic.
 - Do not ask for information that is already known.
 - If the missing field is "path", ask only for the directory path.
-- If the missing field is "intent", ask only how the user wants the files organized.`
+- If the missing field is "intent", ask only how the user wants the files organized.
+- The preferred reply language will be provided as "zh" or "en". If it is "zh", reply in Simplified Chinese. If it is "en", reply in English.`
 
 	knownPath := path
 	if strings.TrimSpace(knownPath) == "" {
@@ -509,7 +538,7 @@ Rules:
 		knownIntent = "(unknown)"
 	}
 
-	userPrompt := fmt.Sprintf("Latest user message:\n%s\n\nKnown path: %s\nKnown organization intent: %s\nMissing field: %s", userText, knownPath, knownIntent, missingField)
+	userPrompt := fmt.Sprintf("Latest user message:\n%s\n\nKnown path: %s\nKnown organization intent: %s\nMissing field: %s\nPreferred reply language: %s", userText, knownPath, knownIntent, missingField, preferredLanguage)
 
 	req := &model.LLMRequest{
 		Contents: []*genai.Content{

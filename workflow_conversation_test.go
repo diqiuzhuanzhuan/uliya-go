@@ -276,6 +276,116 @@ func TestWorkflowRejectsInvalidTargetPathBeforePlanning(t *testing.T) {
 	}
 }
 
+func TestWorkflowKeepsChineseFollowUpAfterPathOnlyReply(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	targetDir := t.TempDir()
+	testModel := &workflowLanguageModel{
+		t:          t,
+		targetPath: targetDir,
+	}
+
+	bashTool, err := bashtool.New(targetDir)
+	if err != nil {
+		t.Fatalf("bashtool.New() error = %v", err)
+	}
+
+	rootAgent, err := newRootAgent(testModel, targetDir, nil, bashTool, todotool.New(), movetool.New())
+	if err != nil {
+		t.Fatalf("newRootAgent() error = %v", err)
+	}
+
+	sessionService := session.InMemoryService()
+	testRunner, err := runner.New(runner.Config{
+		AppName:           consoleAppName,
+		Agent:             rootAgent,
+		SessionService:    sessionService,
+		AutoCreateSession: true,
+	})
+	if err != nil {
+		t.Fatalf("runner.New() error = %v", err)
+	}
+
+	sessionID := "workflow-language-follow-up"
+
+	firstTurn, err := collectRunText(testRunner.Run(context.Background(), consoleUserID, sessionID, genai.NewContentFromText("我想整理下文件", genai.RoleUser), agent.RunConfig{}))
+	if err != nil {
+		t.Fatalf("first turn error = %v", err)
+	}
+	if !strings.Contains(firstTurn, "请提供要整理的目录路径") {
+		t.Fatalf("expected path follow-up question in Chinese, got %q", firstTurn)
+	}
+
+	secondTurn, err := collectRunText(testRunner.Run(context.Background(), consoleUserID, sessionID, genai.NewContentFromText(targetDir, genai.RoleUser), agent.RunConfig{}))
+	if err != nil {
+		t.Fatalf("second turn error = %v", err)
+	}
+	if strings.Contains(secondTurn, "How would you like") {
+		t.Fatalf("did not expect English follow-up after Chinese conversation, got %q", secondTurn)
+	}
+	if !strings.Contains(secondTurn, "你希望我按什么规则整理这些文件") {
+		t.Fatalf("expected intent follow-up question in Chinese, got %q", secondTurn)
+	}
+
+	stored, err := sessionService.Get(context.Background(), &session.GetRequest{
+		AppName:   consoleAppName,
+		UserID:    consoleUserID,
+		SessionID: sessionID,
+	})
+	if err != nil {
+		t.Fatalf("session.Get() error = %v", err)
+	}
+	if got := getStateString(stored.Session.State(), stateKeyResponseLanguage); got != "zh" {
+		t.Fatalf("expected response language to remain zh, got %q", got)
+	}
+}
+
+func TestWorkflowGreetingThenPathAvoidsModelCalls(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	targetDir := t.TempDir()
+	testModel := &workflowRejectingModel{t: t}
+
+	bashTool, err := bashtool.New(targetDir)
+	if err != nil {
+		t.Fatalf("bashtool.New() error = %v", err)
+	}
+
+	rootAgent, err := newRootAgent(testModel, targetDir, nil, bashTool, todotool.New(), movetool.New())
+	if err != nil {
+		t.Fatalf("newRootAgent() error = %v", err)
+	}
+
+	sessionService := session.InMemoryService()
+	testRunner, err := runner.New(runner.Config{
+		AppName:           consoleAppName,
+		Agent:             rootAgent,
+		SessionService:    sessionService,
+		AutoCreateSession: true,
+	})
+	if err != nil {
+		t.Fatalf("runner.New() error = %v", err)
+	}
+
+	sessionID := "workflow-greeting-then-path"
+
+	firstTurn, err := collectRunText(testRunner.Run(context.Background(), consoleUserID, sessionID, genai.NewContentFromText("你好啊", genai.RoleUser), agent.RunConfig{}))
+	if err != nil {
+		t.Fatalf("first turn error = %v", err)
+	}
+	if !strings.Contains(firstTurn, "请告诉我你要整理的目录路径和希望我按什么规则来整理") {
+		t.Fatalf("expected local casual reply in Chinese, got %q", firstTurn)
+	}
+
+	secondTurn, err := collectRunText(testRunner.Run(context.Background(), consoleUserID, sessionID, genai.NewContentFromText(targetDir, genai.RoleUser), agent.RunConfig{}))
+	if err != nil {
+		t.Fatalf("second turn error = %v", err)
+	}
+	if !strings.Contains(secondTurn, "你希望我按什么规则整理这些文件") {
+		t.Fatalf("expected local intent question in Chinese, got %q", secondTurn)
+	}
+}
+
 type workflowScriptModel struct {
 	t          *testing.T
 	targetPath string
@@ -356,6 +466,60 @@ func (m *workflowScriptModel) sawOrganizerTool(name string) bool {
 		}
 	}
 	return false
+}
+
+type workflowLanguageModel struct {
+	t          *testing.T
+	targetPath string
+	requests   []*model.LLMRequest
+}
+
+func (m *workflowLanguageModel) Name() string {
+	return "workflow-language-model"
+}
+
+func (m *workflowLanguageModel) GenerateContent(_ context.Context, req *model.LLMRequest, _ bool) iter.Seq2[*model.LLMResponse, error] {
+	return func(yield func(*model.LLMResponse, error) bool) {
+		m.requests = append(m.requests, req)
+		respText, err := m.respond(req)
+		if !yield(responseWithText(respText), err) {
+			return
+		}
+	}
+}
+
+func (m *workflowLanguageModel) respond(req *model.LLMRequest) (string, error) {
+	contentsText := requestText(req.Contents)
+
+	switch {
+	case strings.Contains(contentsText, "Pending field: (none)") && strings.Contains(contentsText, "我想整理下文件"):
+		return `{"relevant":true,"path":"","intent":"","use_current_workspace":false}`, nil
+	case strings.Contains(contentsText, "Missing field: path"):
+		return "请提供要整理的目录路径。", nil
+	case strings.Contains(contentsText, "Pending field: path") && strings.Contains(contentsText, m.targetPath):
+		return fmt.Sprintf(`{"relevant":true,"path":%q,"intent":"","use_current_workspace":false}`, m.targetPath), nil
+	case strings.Contains(contentsText, "Missing field: intent"):
+		if strings.Contains(contentsText, "Preferred reply language: zh") {
+			return "你希望我按什么规则整理这些文件？", nil
+		}
+		return "How would you like the files in the directory organized?", nil
+	default:
+		return "", fmt.Errorf("unexpected request: contents=%q", contentsText)
+	}
+}
+
+type workflowRejectingModel struct {
+	t *testing.T
+}
+
+func (m *workflowRejectingModel) Name() string {
+	return "workflow-rejecting-model"
+}
+
+func (m *workflowRejectingModel) GenerateContent(_ context.Context, req *model.LLMRequest, _ bool) iter.Seq2[*model.LLMResponse, error] {
+	return func(yield func(*model.LLMResponse, error) bool) {
+		m.t.Fatalf("did not expect model call during local intake flow: %q", requestText(req.Contents))
+	}
 }
 
 func responseWithText(text string) *model.LLMResponse {

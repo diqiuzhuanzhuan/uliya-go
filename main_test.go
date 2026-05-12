@@ -20,6 +20,16 @@ func TestFallbackIntakeAnalysisExtractsExplicitPath(t *testing.T) {
 	}
 }
 
+func TestFallbackIntakeAnalysisRecognizesGeneralOrganizationRequest(t *testing.T) {
+	got := fallbackIntakeAnalysis("我想整理下文件", "")
+	if !got.Relevant {
+		t.Fatalf("expected general organization request to be relevant, got %#v", got)
+	}
+	if got.Path != "" || got.Intent != "" || got.UseCurrentWorkspace {
+		t.Fatalf("expected request to stay incomplete but relevant, got %#v", got)
+	}
+}
+
 func TestHasConcreteTaskValuesRequiresBothPathAndIntent(t *testing.T) {
 	if hasConcreteTaskValues("/Users/ugreen/Downloads", "") {
 		t.Fatal("expected missing intent to be rejected")
@@ -88,6 +98,9 @@ func TestFormatTokenUsageSummaryChinese(t *testing.T) {
 func TestDetectResponseLanguageKeepsChineseForShortConfirmation(t *testing.T) {
 	if got := detectResponseLanguage("zh", "yes"); got != "zh" {
 		t.Fatalf("expected zh to be preserved for short confirmation, got %q", got)
+	}
+	if got := detectResponseLanguage("zh", "/Users/loong/Downloads"); got != "zh" {
+		t.Fatalf("expected zh to be preserved for standalone path replies, got %q", got)
 	}
 	if got := detectResponseLanguage("", "请把下载目录按扩展名整理"); got != "zh" {
 		t.Fatalf("expected zh for Chinese input, got %q", got)
